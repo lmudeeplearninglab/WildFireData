@@ -1,29 +1,4 @@
 # coding=utf-8
-"""Fetch, subset, and visualize NASA FIRMS fire data for analysis and ML.
-
-Integrates functionality from:
-- workspace/firms_data_ingest.ipynb: datetime conversion, timezone, confidence/frp/daynight filters
-- workspace/firms_api_use.ipynb: FIRMS API area endpoint, MAP_KEY validation
-- workspace/subSetDataFromShapeFileOrPolygon.ipynb: shapefile or WKT polygon subsetting
-- workspace/firms_visualization.ipynb: GeoDataFrame maps, time-based coloring, optional basemap
-
-Usage:
-  python visualize_firms_dataset.py
-  python visualize_firms_dataset.py --start-date 2025-01-07 --end-date 2025-01-31
-  python visualize_firms_dataset.py --start-date 2025-01-08 --end-date 2025-01-08  # older data (uses archive)
-  python visualize_firms_dataset.py --days 5 --source VIIRS_SNPP_NRT
-  python visualize_firms_dataset.py --use-archive  # force archive/SP for historical dates
-  python visualize_firms_dataset.py --wkt-polygon "POLYGON((-123 38,-121 38,-121 40,-123 40,-123 38))"
-  python visualize_firms_dataset.py --shapefile states.shp --state "California"
-  python visualize_firms_dataset.py --confidence n,h --min-frp 5 --daynight D
-  python visualize_firms_dataset.py --enrich-earth-engine  # add elevation, NDVI, population, land cover, drought, weather
-  python visualize_firms_dataset.py --fire-mask --area eaton  # fire detection mask for Eaton
-  python visualize_firms_dataset.py --fire-mask --area palisades  # Pacific Palisades
-  python visualize_firms_dataset.py --ee-raster-layers elevation,vegetation,drought --area palisades  # extract + plot EE rasters
-  python visualize_firms_dataset.py  # interactive mode (prompts for options)
-  python visualize_firms_dataset.py -i  # interactive mode (explicit)
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -640,6 +615,7 @@ def plot_fire_mask(
     add_basemap: bool = False,
     cluster_eps: float = 0.02,
     cluster_min_samples: int = 2,
+    centroids_dir: Path | None = None,
 ) -> None:
     """
     Plot fire detection mask as clustered polygons (one polygon per fire cluster).
@@ -709,7 +685,9 @@ def plot_fire_mask(
 
     # Save centroids (cluster centroids when clustered; detection centroids when not)
     if not centroids_df.empty:
-        centroids_path = path.parent / (path.stem.replace("_mask", "") + "_centroids.csv")
+        centroids_root = centroids_dir or path.parent
+        centroids_root.mkdir(parents=True, exist_ok=True)
+        centroids_path = centroids_root / (path.stem.replace("_mask", "") + "_centroids.csv")
         centroids_df.to_csv(centroids_path, index=False)
         print(f"  Saved: {centroids_path} ({len(centroids_df)} centroids)")
 
@@ -794,16 +772,253 @@ def save_outputs(
                 print(f"  KML save failed: {e}")
 
 
+def _bbox_slug(bbox: tuple[float, float, float, float]) -> str:
+    """Create a filesystem-safe bbox label for organizing outputs."""
+    labels = ("w", "s", "e", "n")
+    parts = []
+    for label, value in zip(labels, bbox):
+        token = f"{value:.3f}".replace("-", "m").replace(".", "p")
+        parts.append(f"{label}_{token}")
+    return "bbox_" + "_".join(parts)
+
+
+def get_output_dirs(
+    root_dir: Path,
+    base_name: str,
+    bbox: tuple[float, float, float, float],
+) -> tuple[Path, Path]:
+    """Return dataset and visual output directories for a bbox/area."""
+    group_name = f"{base_name}_{_bbox_slug(bbox)}"
+    dataset_dir = root_dir / "datasets" / group_name
+    visual_dir = root_dir / "visuals" / group_name
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    visual_dir.mkdir(parents=True, exist_ok=True)
+    return dataset_dir, visual_dir
+
+
+EE_FEATURE_VIS = {
+    "elevation": ("terrain", "Elevation"),
+    "vegetation": ("RdYlGn", "Vegetation (NDVI)"),
+    "population": ("Purples", "Population density"),
+    "landcover": ("tab20", "Land cover"),
+    "drought": ("BrBG", "Drought (PDSI)"),
+    "weather_temp": ("YlOrRd", "Max temperature (C)"),
+    "weather_precip": ("Blues", "Precipitation (mm)"),
+    "ee_elevation": ("terrain", "Elevation"),
+    "ee_ndvi": ("RdYlGn", "NDVI"),
+    "ee_population_density": ("Purples", "Population density"),
+    "ee_landcover": ("tab20", "Land cover"),
+    "ee_pdsi": ("BrBG", "Drought (PDSI)"),
+    "ee_pr": ("Blues", "GRIDMET pr"),
+    "ee_sph": ("viridis", "GRIDMET sph"),
+    "ee_th": ("magma", "GRIDMET th"),
+    "ee_tmmn": ("coolwarm", "GRIDMET tmmn"),
+    "ee_tmmx": ("coolwarm", "GRIDMET tmmx"),
+    "ee_vs": ("cividis", "GRIDMET vs"),
+    "ee_erc": ("inferno", "GRIDMET erc"),
+}
+
+
+def _get_ee_feature_columns(df: pd.DataFrame) -> list[str]:
+    """Return Earth Engine feature columns present in the dataframe."""
+    return [c for c in df.columns if c.startswith("ee_")]
+
+
+def _get_ee_feature_label(feature_col: str) -> str:
+    """Human-readable label for an Earth Engine feature column."""
+    if feature_col in EE_FEATURE_VIS:
+        return EE_FEATURE_VIS[feature_col][1]
+    return feature_col.removeprefix("ee_").replace("_", " ").title()
+
+
+def plot_ee_feature_map(
+    df: pd.DataFrame,
+    bbox: tuple[float, float, float, float],
+    feature_col: str,
+    path: Path,
+    title: str | None = None,
+    lon_col: str = "longitude",
+    lat_col: str = "latitude",
+) -> None:
+    """Save one standalone PNG for a single sampled Earth Engine feature."""
+    if (
+        df.empty
+        or feature_col not in df.columns
+        or lon_col not in df.columns
+        or lat_col not in df.columns
+    ):
+        return
+
+    label = _get_ee_feature_label(feature_col)
+    plot_title = title or label
+    w, s, e, n = bbox
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.set_xlim(w, e)
+    ax.set_ylim(s, n)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.3)
+
+    sub = df[[lon_col, lat_col, feature_col]].copy()
+    sub[feature_col] = pd.to_numeric(sub[feature_col], errors="coerce")
+    sub = sub.dropna(subset=[lon_col, lat_col, feature_col])
+    if sub.empty:
+        ax.set_title(f"{plot_title} (no data)")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved: {path}")
+        return
+
+    cmap = EE_FEATURE_VIS.get(feature_col, ("viridis", label))[0]
+    sc = ax.scatter(
+        sub[lon_col],
+        sub[lat_col],
+        c=sub[feature_col],
+        s=18,
+        cmap=cmap,
+        alpha=0.85,
+    )
+    ax.set_title(f"{plot_title} ({len(sub)} points)")
+    plt.colorbar(sc, ax=ax, label=label)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+def plot_ee_feature_grid(
+    df: pd.DataFrame,
+    bbox: tuple[float, float, float, float],
+    path: Path,
+    title: str = "Google Earth Engine feature grid",
+    feature_cols: list[str] | None = None,
+    lon_col: str = "longitude",
+    lat_col: str = "latitude",
+) -> None:
+    """Save one PNG with a subplot for each sampled Earth Engine feature."""
+    ee_cols = feature_cols or _get_ee_feature_columns(df)
+    ee_cols = [c for c in ee_cols if c in df.columns]
+    if df.empty or not ee_cols or lon_col not in df.columns or lat_col not in df.columns:
+        return
+
+    n_panels = len(ee_cols)
+    ncols = 2 if n_panels <= 4 else 3
+    nrows = int(np.ceil(n_panels / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows))
+    axes = np.atleast_1d(axes).ravel()
+    w, s, e, n = bbox
+
+    for ax, feature_col in zip(axes, ee_cols):
+        label = _get_ee_feature_label(feature_col)
+        ax.set_xlim(w, e)
+        ax.set_ylim(s, n)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.3)
+
+        sub = df[[lon_col, lat_col, feature_col]].copy()
+        sub[feature_col] = pd.to_numeric(sub[feature_col], errors="coerce")
+        sub = sub.dropna(subset=[lon_col, lat_col, feature_col])
+        if sub.empty:
+            ax.set_title(f"{label} (no data)")
+            continue
+
+        cmap = EE_FEATURE_VIS.get(feature_col, ("viridis", label))[0]
+        sc = ax.scatter(
+            sub[lon_col],
+            sub[lat_col],
+            c=sub[feature_col],
+            s=16,
+            cmap=cmap,
+            alpha=0.85,
+        )
+        ax.set_title(f"{label} ({len(sub)} points)")
+        plt.colorbar(sc, ax=ax, label=label, shrink=0.85)
+
+    for ax in axes[n_panels:]:
+        ax.axis("off")
+
+    fig.suptitle(title)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+def save_earth_engine_outputs(
+    df: pd.DataFrame,
+    out_dir: Path,
+    base_name: str,
+    bbox: tuple[float, float, float, float],
+) -> None:
+    """
+    Save Earth Engine enrichment separately from fire-mask/fire-detection outputs.
+    Writes one combined CSV, one CSV per EE feature, and one grid PNG.
+    """
+    if df.empty:
+        return
+
+    ee_cols = _get_ee_feature_columns(df)
+    if not ee_cols:
+        print("  NOTE: No Earth Engine feature columns were available to save.")
+        return
+
+    drop_cols = [c for c in ["geometry", "index_right"] if c in df.columns]
+    out = df.drop(columns=drop_cols, errors="ignore") if drop_cols else df
+
+    combined_csv_path = out_dir / f"{base_name}_ee_features.csv"
+    out.to_csv(combined_csv_path, index=False)
+    print(f"  Saved: {combined_csv_path} ({len(out)} rows)")
+
+    base_cols = [c for c in out.columns if c not in ee_cols]
+    for feature_col in ee_cols:
+        feature_out = out[base_cols + [feature_col]]
+        feature_csv_path = out_dir / f"{base_name}_{feature_col}.csv"
+        feature_out.to_csv(feature_csv_path, index=False)
+        print(f"  Saved: {feature_csv_path} ({len(feature_out)} rows)")
+        feature_png_path = out_dir / f"{base_name}_{feature_col}.png"
+        plot_ee_feature_map(
+            df,
+            bbox,
+            feature_col,
+            feature_png_path,
+            title=f"{base_name} – {_get_ee_feature_label(feature_col)}",
+        )
+
+    grid_path = out_dir / f"{base_name}_ee_features_grid.png"
+    plot_ee_feature_grid(df, bbox, grid_path, title=f"{base_name} – Google Earth Engine features")
+
+
 # ---------------------------------------------------------------------------
 # Earth Engine raster extraction and visualization (like fire footprints)
 # ---------------------------------------------------------------------------
 EE_RASTER_SCALE = 500   # meters per pixel (min); increased for large regions
 EE_RASTER_MAX_PIXELS = 262144  # sampleRectangle limit
+EE_RASTER_SCALE_BY_LAYER = {
+    "elevation": 500,
+    "vegetation": 1000,
+    "landcover": 250,
+    "population": 1000,
+    "drought": 4000,
+    "weather_temp": 4000,
+    "weather_precip": 4000,
+}
+EE_STANDALONE_FEATURE_LAYERS = (
+    "elevation",
+    "vegetation",
+    "population",
+    "landcover",
+    "drought",
+    "weather_temp",
+    "weather_precip",
+)
 
 # Layer config: (EE dataset, band(s), is_time_varying, title)
 EE_RASTER_LAYER_CONFIG = {
     "elevation": ("USGS/SRTMGL1_003", ["elevation"], False, "Elevation (m)"),
     "vegetation": ("NASA/VIIRS/002/VNP13A1", ["NDVI"], True, "Vegetation (NDVI)"),
+    "landcover": ("ESA/WorldCover/v100", ["Map"], False, "Land cover"),
     "drought": ("GRIDMET/DROUGHT", ["pdsi"], True, "Drought (PDSI)"),
     "weather_temp": ("IDAHO_EPSCOR/GRIDMET", ["tmmx"], True, "Max temperature (°C)"),
     "weather_precip": ("IDAHO_EPSCOR/GRIDMET", ["pr"], True, "Precipitation (mm)"),
@@ -811,7 +1026,37 @@ EE_RASTER_LAYER_CONFIG = {
 }
 
 
-def _get_ee_image_for_layer(layer_key: str, date_str: str | None) -> ee.Image | None:
+def _get_ee_scale_for_layer(layer_key: str) -> int:
+    """Nominal sampling scale for each EE layer."""
+    return EE_RASTER_SCALE_BY_LAYER.get(layer_key, EE_RASTER_SCALE)
+
+
+def _get_time_window(
+    date_str: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    lookback_days: int = 30,
+) -> tuple[str | None, str | None]:
+    """Return an EE date window covering the fire period or a fallback lookback."""
+    if start_date and end_date:
+        start_dt = pd.to_datetime(start_date) - pd.Timedelta(days=lookback_days)
+        end_dt = pd.to_datetime(end_date) + pd.Timedelta(days=1)
+        return start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
+    if date_str:
+        end_dt = pd.to_datetime(date_str) + pd.Timedelta(days=1)
+        start_dt = pd.to_datetime(date_str) - pd.Timedelta(days=lookback_days)
+        return start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
+    end_dt = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)
+    start_dt = end_dt - pd.Timedelta(days=lookback_days)
+    return start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
+
+
+def _get_ee_image_for_layer(
+    layer_key: str,
+    date_str: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> ee.Image | None:
     """Get EE Image for a raster layer. Returns None if EE not available."""
     if not HAS_EARTH_ENGINE or layer_key not in EE_RASTER_LAYER_CONFIG:
         return None
@@ -819,28 +1064,92 @@ def _get_ee_image_for_layer(layer_key: str, date_str: str | None) -> ee.Image | 
     if layer_key == "population":
         # CIESIN GPW is ImageCollection (years 2000–2020), not a single Image
         img = ee.ImageCollection(dataset).select(bands).filterDate("2020-01-01", "2020-12-31").first()
+    elif layer_key == "landcover":
+        img = ee.ImageCollection(dataset).select(bands).first()
     elif is_time_varying and date_str:
-        # Use 30-day lookback for GRIDMET/VIIRS to handle data lag; take most recent
-        from datetime import datetime, timedelta
-        start = (pd.to_datetime(date_str) - timedelta(days=30)).strftime("%Y-%m-%d")
-        img = ee.ImageCollection(dataset).filterDate(start, date_str).select(bands).sort("system:time_start", False).first()
+        window_start, window_end = _get_time_window(date_str=date_str, start_date=start_date, end_date=end_date)
+        coll = ee.ImageCollection(dataset).filterDate(window_start, window_end).select(bands)
+        if layer_key == "weather_precip":
+            img = coll.sum()
+        elif layer_key == "weather_temp":
+            img = coll.mean()
+        else:
+            img = coll.median()
     elif is_time_varying:
-        from datetime import datetime, timedelta
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-        img = ee.ImageCollection(dataset).filterDate(start, date_str).select(bands).sort("system:time_start", False).first()
+        window_start, window_end = _get_time_window(date_str=date_str, start_date=start_date, end_date=end_date)
+        coll = ee.ImageCollection(dataset).filterDate(window_start, window_end).select(bands)
+        if layer_key == "weather_precip":
+            img = coll.sum()
+        elif layer_key == "weather_temp":
+            img = coll.mean()
+        else:
+            img = coll.median()
     else:
         img = ee.Image(dataset).select(bands)
     # Apply scale factors (VIIRS NDVI: 0.0001)
     if layer_key == "vegetation":
         img = img.multiply(0.0001)
-    return img
+    if img is None:
+        return None
+    return img.rename(layer_key)
+
+
+def raster_array_to_dataframe(
+    arr: np.ndarray,
+    bbox: tuple[float, float, float, float],
+    value_col: str,
+) -> pd.DataFrame:
+    """Flatten a raster into a standalone lon/lat/value dataset."""
+    if arr.size == 0:
+        return pd.DataFrame(columns=["longitude", "latitude", value_col])
+
+    w, s, e, n = bbox
+    nrows, ncols = arr.shape
+    lon_step = (e - w) / max(ncols, 1)
+    lat_step = (n - s) / max(nrows, 1)
+    lon_vals = w + lon_step * (np.arange(ncols) + 0.5)
+    lat_vals = n - lat_step * (np.arange(nrows) + 0.5)
+    lon_grid, lat_grid = np.meshgrid(lon_vals, lat_vals)
+
+    out = pd.DataFrame(
+        {
+            "longitude": lon_grid.ravel(),
+            "latitude": lat_grid.ravel(),
+            value_col: arr.ravel(),
+        }
+    )
+    out[value_col] = pd.to_numeric(out[value_col], errors="coerce")
+    return out.dropna(subset=[value_col]).reset_index(drop=True)
+
+
+def get_fire_centroids_dataframe(
+    df: pd.DataFrame,
+    cluster_eps: float = 0.02,
+    cluster_min_samples: int = 2,
+) -> pd.DataFrame:
+    """Return centroids for the fire detections to support centroid-based EE sampling."""
+    if df.empty or "latitude" not in df.columns or "longitude" not in df.columns:
+        return pd.DataFrame(columns=["cluster_id", "centroid_lat", "centroid_lon", "n_detections"])
+
+    _, centroids_df = cluster_fire_points_to_polygons(
+        df, eps_deg=cluster_eps, min_samples=cluster_min_samples
+    )
+    if centroids_df.empty:
+        centroids_df = df[["latitude", "longitude"]].copy()
+        centroids_df = centroids_df.rename(
+            columns={"latitude": "centroid_lat", "longitude": "centroid_lon"}
+        )
+        centroids_df.insert(0, "cluster_id", np.arange(len(centroids_df)))
+        centroids_df["n_detections"] = 1
+    return centroids_df.reset_index(drop=True)
 
 
 def extract_ee_raster(
     bbox: tuple[float, float, float, float],
     layer_key: str,
     date_str: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
     scale: int = EE_RASTER_SCALE,
     ee_project: str | None = None,
 ) -> tuple[np.ndarray, tuple[float, float, float, float]] | None:
@@ -850,37 +1159,106 @@ def extract_ee_raster(
     """
     if not HAS_EARTH_ENGINE or not _init_earth_engine(ee_project):
         return None
-    img = _get_ee_image_for_layer(layer_key, date_str)
+    img = _get_ee_image_for_layer(layer_key, date_str, start_date=start_date, end_date=end_date)
     if img is None:
         return None
     w, s, e, n = bbox
     region = ee.Geometry.Rectangle([w, s, e, n])
     # Ensure we stay under sampleRectangle limit (262144 pixels)
-    width_m = abs(e - w) * 111000 * 1000 * max(0.7, np.cos(np.radians((s + n) / 2)))
-    height_m = abs(n - s) * 111000 * 1000
+    width_m = abs(e - w) * 111000 * max(0.7, np.cos(np.radians((s + n) / 2)))
+    height_m = abs(n - s) * 111000
     max_dim = int(np.sqrt(EE_RASTER_MAX_PIXELS))
     scale_x = width_m / max_dim
     scale_y = height_m / max_dim
-    actual_scale = max(scale, int(np.ceil(max(scale_x, scale_y))))
+    layer_scale = _get_ee_scale_for_layer(layer_key)
+    area_scale = np.sqrt((width_m * height_m) / max(1, int(EE_RASTER_MAX_PIXELS * 0.8)))
+    actual_scale = max(scale, layer_scale, int(np.ceil(max(scale_x, scale_y, area_scale))))
     crs = "EPSG:4326"
-    img = img.reproject(crs=crs, scale=actual_scale)
+    for _ in range(5):
+        try:
+            img_for_sample = img.reproject(crs=crs, scale=actual_scale).clip(region).unmask(-9999)
+            result = img_for_sample.sampleRectangle(region=region, defaultValue=-9999)
+            info = result.getInfo()
+            if not info or "properties" not in info:
+                return None
+            props = info["properties"]
+            raw = props.get(layer_key)
+            if raw is None:
+                return None
+            arr = np.asarray(raw, dtype=float)
+            if arr.ndim < 2:
+                arr = np.atleast_2d(arr)
+            arr[arr == -9999] = np.nan
+            return arr, bbox
+        except Exception as ex:
+            if "Too many pixels" in str(ex):
+                actual_scale = int(np.ceil(actual_scale * 1.5))
+                continue
+            print(f"  EE raster extract failed ({layer_key}): {ex}")
+            return None
+    print(f"  EE raster extract failed ({layer_key}): exceeded pixel limit after rescaling")
+    return None
+
+
+def sample_ee_at_points(
+    points_df: pd.DataFrame,
+    layer_key: str,
+    date_str: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    ee_project: str | None = None,
+    lon_col: str = "longitude",
+    lat_col: str = "latitude",
+) -> pd.DataFrame:
+    """Sample one EE layer at point locations and return a standalone dataset."""
+    if (
+        points_df.empty
+        or lon_col not in points_df.columns
+        or lat_col not in points_df.columns
+        or not HAS_EARTH_ENGINE
+        or not _init_earth_engine(ee_project)
+    ):
+        return pd.DataFrame()
+
+    img = _get_ee_image_for_layer(layer_key, date_str, start_date=start_date, end_date=end_date)
+    if img is None:
+        return pd.DataFrame()
+    img = img.unmask(-9999)
+
+    features = []
+    rows = points_df.reset_index(drop=True)
+    for idx, row in rows.iterrows():
+        features.append(
+            ee.Feature(
+                ee.Geometry.Point([row[lon_col], row[lat_col]]),
+                {"row_id": int(idx)},
+            )
+        )
+
     try:
-        result = img.sampleRectangle(region=region)
-        info = result.getInfo()
-        if not info or "properties" not in info:
-            return None
-        props = info["properties"]
-        band_names = list(props.keys())
-        if not band_names:
-            return None
-        raw = props[band_names[0]]
-        arr = np.array(raw, dtype=float, copy=False)
-        if arr.ndim < 2:
-            arr = np.atleast_2d(arr)
-        return arr, bbox
+        sampled = img.sampleRegions(
+            collection=ee.FeatureCollection(features),
+            properties=["row_id"],
+            scale=_get_ee_scale_for_layer(layer_key),
+            tileScale=4,
+        ).getInfo()
     except Exception as ex:
-        print(f"  EE raster extract failed ({layer_key}): {ex}")
-        return None
+        print(f"  EE point sampling failed ({layer_key}): {ex}")
+        return pd.DataFrame()
+
+    out = rows.copy()
+    out[layer_key] = np.nan
+    features_out = sampled.get("features", []) if sampled else []
+    for feature in features_out:
+        props = feature.get("properties", {})
+        row_id = props.get("row_id")
+        if row_id is None or row_id >= len(out):
+            continue
+        value = props.get(layer_key)
+        if value == -9999:
+            value = np.nan
+        out.at[row_id, layer_key] = value
+    return out
 
 
 def plot_raster_layer(
@@ -951,9 +1329,12 @@ EE_RASTER_VIS = {
 def extract_and_plot_ee_raster_layers(
     bbox: tuple[float, float, float, float],
     layers: list[str],
-    out_dir: Path,
+    data_dir: Path,
+    visual_dir: Path,
     base_name: str,
     date_str: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
     add_basemap: bool = False,
     ee_project: str | None = None,
 ) -> None:
@@ -973,11 +1354,20 @@ def extract_and_plot_ee_raster_layers(
         return
 
     print(f"Extracting and visualizing EE raster layers: {', '.join(valid_layers)}")
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = Path(data_dir)
+    visual_dir = Path(visual_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    visual_dir.mkdir(parents=True, exist_ok=True)
 
     for layer_key in valid_layers:
-        result = extract_ee_raster(bbox, layer_key, date_str, ee_project=ee_project)
+        result = extract_ee_raster(
+            bbox,
+            layer_key,
+            date_str,
+            start_date=start_date,
+            end_date=end_date,
+            ee_project=ee_project,
+        )
         if result is None:
             continue
         arr, bounds = result
@@ -986,16 +1376,324 @@ def extract_and_plot_ee_raster_layers(
         cmap, vmin, vmax = vis
 
         # Save array for reuse (like fire footprint CSV)
-        npy_path = out_dir / f"{base_name}_{layer_key}.npy"
-        meta_path = out_dir / f"{base_name}_{layer_key}_bounds.txt"
+        npy_path = data_dir / f"{base_name}_{layer_key}.npy"
+        meta_path = data_dir / f"{base_name}_{layer_key}_bounds.txt"
         np.save(npy_path, arr)
         with open(meta_path, "w") as f:
             f.write(f"{bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]}\n")
         print(f"  Extracted: {npy_path}")
 
         # Visualize (like fire mask PNG)
-        png_path = out_dir / f"{base_name}_{layer_key}.png"
+        png_path = visual_dir / f"{base_name}_{layer_key}.png"
         plot_raster_layer(arr, bounds, title, png_path, cmap=cmap, vmin=vmin, vmax=vmax, add_basemap=add_basemap)
+
+
+def plot_ee_raster_grid(
+    layer_results: list[tuple[str, np.ndarray, tuple[float, float, float, float]]],
+    path: Path,
+    title: str,
+) -> None:
+    """Save one figure containing all standalone EE raster feature maps."""
+    if not layer_results:
+        return
+
+    n_panels = len(layer_results)
+    ncols = 2 if n_panels <= 4 else 3
+    nrows = int(np.ceil(n_panels / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows))
+    axes = np.atleast_1d(axes).ravel()
+
+    for ax, (layer_key, arr, bounds) in zip(axes, layer_results):
+        w, s, e, n = bounds
+        masked = np.ma.masked_invalid(arr.astype(float))
+        cmap, vis_title = EE_FEATURE_VIS.get(layer_key, ("viridis", layer_key))
+        vis_meta = EE_RASTER_VIS.get(layer_key, (cmap, None, None))
+        cmap = vis_meta[0]
+        vmin = vis_meta[1]
+        vmax = vis_meta[2]
+
+        if masked.size == 0 or np.all(masked.mask):
+            ax.set_title(f"{vis_title} (no data)")
+            ax.set_xlim(w, e)
+            ax.set_ylim(s, n)
+            ax.grid(True, alpha=0.3)
+            continue
+
+        im = ax.imshow(
+            masked,
+            extent=[w, e, s, n],
+            origin="upper",
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            aspect="auto",
+            interpolation="nearest",
+        )
+        plt.colorbar(im, ax=ax, label=vis_title, shrink=0.85)
+        ax.set_xlim(w, e)
+        ax.set_ylim(s, n)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.set_title(vis_title)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, alpha=0.3)
+
+    for ax in axes[n_panels:]:
+        ax.axis("off")
+
+    fig.suptitle(title)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+def export_standalone_ee_feature_datasets(
+    bbox: tuple[float, float, float, float],
+    data_dir: Path,
+    visual_dir: Path,
+    base_name: str,
+    date_str: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    add_basemap: bool = False,
+    ee_project: str | None = None,
+    layers: tuple[str, ...] = EE_STANDALONE_FEATURE_LAYERS,
+    fire_df: pd.DataFrame | None = None,
+    cluster_eps: float = 0.02,
+    cluster_min_samples: int = 2,
+) -> None:
+    """
+    Export Earth Engine features as standalone raster datasets, not FIRMS-row enrichments.
+    Saves bbox rasters and centroid-based samples so features can be reviewed either way.
+    """
+    valid_layers = [l for l in layers if l in EE_RASTER_LAYER_CONFIG]
+    if not valid_layers:
+        return
+
+    layer_results: list[tuple[str, np.ndarray, tuple[float, float, float, float]]] = []
+    combined_rows: list[pd.DataFrame] = []
+    centroid_wide_df = pd.DataFrame()
+    centroid_long_rows: list[pd.DataFrame] = []
+    centroids_df = (
+        get_fire_centroids_dataframe(
+            fire_df, cluster_eps=cluster_eps, cluster_min_samples=cluster_min_samples
+        )
+        if fire_df is not None and not fire_df.empty
+        else pd.DataFrame()
+    )
+    if not centroids_df.empty:
+        centroid_wide_df = centroids_df.rename(
+            columns={"centroid_lon": "longitude", "centroid_lat": "latitude"}
+        ).copy()
+    print(f"Exporting standalone EE feature datasets: {', '.join(valid_layers)}")
+
+    for layer_key in valid_layers:
+        result = extract_ee_raster(
+            bbox,
+            layer_key,
+            date_str,
+            start_date=start_date,
+            end_date=end_date,
+            ee_project=ee_project,
+        )
+        if result is not None:
+            arr, bounds = result
+            layer_results.append((layer_key, arr, bounds))
+            _, _, _, layer_title = EE_RASTER_LAYER_CONFIG[layer_key]
+            cmap, vmin, vmax = EE_RASTER_VIS.get(layer_key, ("viridis", None, None))
+
+            npy_path = data_dir / f"{base_name}_{layer_key}.npy"
+            meta_path = data_dir / f"{base_name}_{layer_key}_bounds.txt"
+            csv_path = data_dir / f"{base_name}_{layer_key}_grid.csv"
+            png_path = visual_dir / f"{base_name}_{layer_key}.png"
+
+            np.save(npy_path, arr)
+            with open(meta_path, "w") as f:
+                f.write(f"{bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]}\n")
+            print(f"  Saved: {npy_path}")
+
+            layer_df = raster_array_to_dataframe(arr, bounds, layer_key)
+            layer_df.to_csv(csv_path, index=False)
+            print(f"  Saved: {csv_path} ({len(layer_df)} rows)")
+
+            combined_rows.append(layer_df.assign(layer=layer_key).rename(columns={layer_key: "value"}))
+            plot_raster_layer(arr, bounds, layer_title, png_path, cmap=cmap, vmin=vmin, vmax=vmax, add_basemap=add_basemap)
+
+        if not centroids_df.empty:
+            centroid_layer_df = sample_ee_at_points(
+                centroid_wide_df[["cluster_id", "n_detections", "longitude", "latitude"]],
+                layer_key,
+                date_str=date_str,
+                start_date=start_date,
+                end_date=end_date,
+                ee_project=ee_project,
+            )
+            if not centroid_layer_df.empty:
+                centroid_csv_path = data_dir / f"{base_name}_{layer_key}_centroids.csv"
+                centroid_png_path = visual_dir / f"{base_name}_{layer_key}_centroids.png"
+                centroid_layer_df.to_csv(centroid_csv_path, index=False)
+                print(f"  Saved: {centroid_csv_path} ({len(centroid_layer_df)} rows)")
+                plot_ee_feature_map(
+                    centroid_layer_df,
+                    bbox,
+                    layer_key,
+                    centroid_png_path,
+                    title=f"{base_name} – {_get_ee_feature_label(layer_key)} centroids",
+                )
+                centroid_wide_df[layer_key] = centroid_layer_df[layer_key].values
+                centroid_long_rows.append(
+                    centroid_layer_df.assign(layer=layer_key).rename(columns={layer_key: "value"})
+                )
+
+    if combined_rows:
+        combined_path = data_dir / f"{base_name}_ee_features_standalone.csv"
+        pd.concat(combined_rows, ignore_index=True).to_csv(combined_path, index=False)
+        print(f"  Saved: {combined_path}")
+
+    grid_path = visual_dir / f"{base_name}_ee_features_grid.png"
+    plot_ee_raster_grid(layer_results, grid_path, title=f"{base_name} – Google Earth Engine features")
+    if centroid_long_rows:
+        centroid_combined_path = data_dir / f"{base_name}_ee_features_centroids.csv"
+        pd.concat(centroid_long_rows, ignore_index=True).to_csv(centroid_combined_path, index=False)
+        print(f"  Saved: {centroid_combined_path}")
+        centroid_grid_path = visual_dir / f"{base_name}_ee_features_centroids_grid.png"
+        plot_ee_feature_grid(
+            centroid_wide_df,
+            bbox,
+            centroid_grid_path,
+            title=f"{base_name} – Google Earth Engine features at fire centroids",
+            feature_cols=valid_layers,
+        )
+
+
+def export_daily_visual_samples(
+    df: pd.DataFrame,
+    bbox: tuple[float, float, float, float],
+    dataset_root: Path,
+    visual_root: Path,
+    base_name: str,
+    plot_points: bool = True,
+    fire_mask: bool = False,
+    time_plot: bool = False,
+    add_basemap: bool = False,
+    enrich_earth_engine: bool = False,
+    ee_raster_layers: list[str] | None = None,
+    ee_project: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    cluster_eps: float = 0.02,
+    cluster_min_samples: int = 2,
+) -> None:
+    """
+    Export one day-by-day sample folder with fire and EE visualizations.
+    Each day gets its own subdirectory so the fire signal and same-day features
+    can be reviewed side by side across the requested time range.
+    """
+    df = add_acq_datetime(df)
+    if "acq_date" in df.columns:
+        df = df.copy()
+        df["_acq_date_str"] = pd.to_datetime(df["acq_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    if start_date or end_date:
+        start_str = start_date or end_date
+        end_str = end_date or start_date or start_str
+        day_list = [d.strftime("%Y-%m-%d") for d in pd.date_range(start=start_str, end=end_str, freq="D")]
+    elif not df.empty and "acq_date" in df.columns:
+        day_list = sorted(x for x in df["_acq_date_str"].dropna().unique().tolist() if x)
+    else:
+        return
+
+    if not day_list:
+        return
+
+    daily_data_root = dataset_root / "daily_samples"
+    daily_visual_root = visual_root / "daily_samples"
+    daily_data_root.mkdir(parents=True, exist_ok=True)
+    daily_visual_root.mkdir(parents=True, exist_ok=True)
+    color_col = "frp" if "frp" in df.columns else "bright_ti4"
+    print(f"Exporting daily visual samples to: {daily_visual_root}")
+
+    for day_str in day_list:
+        day_data_dir = daily_data_root / day_str
+        day_visual_dir = daily_visual_root / day_str
+        day_data_dir.mkdir(parents=True, exist_ok=True)
+        day_visual_dir.mkdir(parents=True, exist_ok=True)
+        if not df.empty and "_acq_date_str" in df.columns:
+            day_df = df[df["_acq_date_str"] == day_str].copy()
+        else:
+            day_df = pd.DataFrame()
+
+        day_base = f"{base_name}_{day_str}"
+
+        save_outputs(
+            day_df,
+            day_data_dir,
+            day_base,
+            save_csv=True,
+            save_shp=False,
+            save_kml=False,
+            save_hdf5=False,
+        )
+
+        if plot_points or (not fire_mask and not time_plot):
+            plot_fire_map(
+                day_df,
+                f"FIRMS – {base_name} {day_str}",
+                bbox,
+                day_visual_dir / f"{day_base}_fire.png",
+                color_col,
+            )
+        if fire_mask:
+            plot_fire_mask(
+                day_df,
+                f"FIRMS – {base_name} {day_str} fire mask",
+                bbox,
+                day_visual_dir / f"{day_base}_mask.png",
+                add_basemap=add_basemap,
+                cluster_eps=cluster_eps,
+                cluster_min_samples=cluster_min_samples,
+                centroids_dir=day_data_dir,
+            )
+        if time_plot:
+            plot_fire_map_time_based(
+                day_df,
+                f"FIRMS – {base_name} {day_str} time-based",
+                bbox,
+                day_visual_dir / f"{day_base}_time.png",
+                add_basemap=add_basemap,
+            )
+
+        if enrich_earth_engine and HAS_EARTH_ENGINE:
+            export_standalone_ee_feature_datasets(
+                bbox,
+                day_data_dir,
+                day_visual_dir,
+                day_base,
+                date_str=day_str,
+                start_date=day_str,
+                end_date=day_str,
+                add_basemap=add_basemap,
+                ee_project=ee_project,
+                fire_df=day_df,
+                cluster_eps=cluster_eps,
+                cluster_min_samples=cluster_min_samples,
+            )
+        elif enrich_earth_engine:
+            print("  WARNING: daily EE export ignored. Install: pip install earthengine-api")
+
+        if ee_raster_layers:
+            extract_and_plot_ee_raster_layers(
+                bbox,
+                ee_raster_layers,
+                day_data_dir,
+                day_visual_dir,
+                day_base,
+                date_str=day_str,
+                start_date=day_str,
+                end_date=day_str,
+                add_basemap=add_basemap,
+                ee_project=ee_project,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1336,10 +2034,11 @@ def run_interactive() -> argparse.Namespace:
     args.save_shapefile = _prompt("Save Shapefile? (y/n)", "n").lower().startswith("y")
     args.save_kml = _prompt("Save KML? (y/n)", "n").lower().startswith("y")
     args.save_hdf5 = _prompt("Save HDF5? (y/n)", "n").lower().startswith("y")
-    args.enrich_earth_engine = _prompt("Enrich with Earth Engine? (y/n)", "n").lower().startswith("y")
+    args.enrich_earth_engine = _prompt("Export standalone Earth Engine features? (y/n)", "n").lower().startswith("y")
+    args.daily_visual_samples = _prompt("Export daily fire + EE visual samples? (y/n)", "n").lower().startswith("y")
     ee_in = _prompt("EE raster layers (comma-separated or 'all'; Enter for none)", "")
     if ee_in and ee_in.strip().lower() == "all":
-        args.ee_raster_layers = "elevation,vegetation,drought,weather_temp,weather_precip,population"
+        args.ee_raster_layers = "elevation,vegetation,landcover,drought,weather_temp,weather_precip,population"
     else:
         args.ee_raster_layers = ee_in.strip() if ee_in else None
     # EE config (uses your start_date, end_date, region/bbox from above)
@@ -1403,7 +2102,8 @@ def main() -> None:
     parser.add_argument("--cluster-min-samples", type=int, default=2, help="Min detections per cluster. Used with --fire-mask.")
     parser.add_argument("--all-viz", action="store_true", help="All visualization types: points, fire mask, time-based")
     parser.add_argument("--basemap", action="store_true", help="Add basemap to time plot / fire mask (requires contextily)")
-    parser.add_argument("--enrich-earth-engine", action="store_true", help="Add EE features: elevation, NDVI, population, land cover, drought (PDSI), weather (GRIDMET). Requires earthengine authenticate.")
+    parser.add_argument("--enrich-earth-engine", action="store_true", help="Export standalone EE feature datasets for the fire-time window: elevation, NDVI, population, land cover, drought (PDSI), weather. Requires earthengine authenticate.")
+    parser.add_argument("--daily-visual-samples", action="store_true", help="Create per-day folders containing daily fire visualizations and same-day EE feature outputs across the selected date range.")
     parser.add_argument("--ee-raster-layers", type=str, default=None, metavar="Layers",
                         help="Extract and visualize EE raster layers. Comma-separated or 'all' for all layers")
     parser.add_argument("--ee-project", type=str, default=None, help="GCP/EE project ID (for EE init; uses your start_date, end_date, region)")
@@ -1434,7 +2134,7 @@ def main() -> None:
         sources = SOURCES_NRT
     else:
         sources = SOURCES  # NRT first, then archive fallback
-    out_dir = args.output_dir or (Path(__file__).resolve().parent / "firms_output")
+    out_dir = args.output_dir or (Path(__file__).resolve().parent / "data output")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {out_dir.resolve()}\n")
@@ -1452,6 +2152,19 @@ def main() -> None:
             if len(parts) == 4:
                 return tuple(parts), "firms_custom"
         return CALIFORNIA_BBOX, "firms_california"
+
+    def _get_fire_date_window(df_subset: pd.DataFrame) -> tuple[str | None, str | None, str | None]:
+        """Return (min_date, max_date, reference_date) for EE queries."""
+        if not df_subset.empty and "acq_date" in df_subset.columns:
+            dates = pd.to_datetime(df_subset["acq_date"], errors="coerce").dropna()
+            if not dates.empty:
+                start_date = dates.min().strftime("%Y-%m-%d")
+                end_date = dates.max().strftime("%Y-%m-%d")
+                return start_date, end_date, end_date
+        start_date = args.start_date
+        end_date = args.end_date or args.start_date
+        ref_date = end_date or start_date or datetime.now().strftime("%Y-%m-%d")
+        return start_date, end_date, ref_date
 
     # Shapefile/WKT path: single output, no multi-area
     use_areas = not args.wkt_polygon and not args.shapefile
@@ -1514,66 +2227,148 @@ def main() -> None:
             df = subset_by_shapefile(df, args.shapefile, state_name=args.state)
             base_name = "firms_shapefile" + (f"_{args.state}" if args.state else "")
         bbox = fetch_bbox
+        dataset_dir, visual_dir = get_output_dirs(out_dir, base_name, bbox)
         if not df.empty:
             df = add_acq_datetime(df)
             df = add_footprint_columns(df)
-            if args.enrich_earth_engine and HAS_EARTH_ENGINE:
-                df = enrich_with_earth_engine(df, ee_project=getattr(args, "ee_project", None))
-            elif args.enrich_earth_engine:
-                print("  WARNING: --enrich-earth-engine ignored. Install: pip install earthengine-api")
-            save_outputs(df, out_dir, base_name, save_csv=True, save_shp=args.save_shapefile, save_kml=args.save_kml, save_hdf5=args.save_hdf5)
+            save_outputs(df, dataset_dir, base_name, save_csv=True, save_shp=args.save_shapefile, save_kml=args.save_kml, save_hdf5=args.save_hdf5)
             color_col = "frp" if "frp" in df.columns else "bright_ti4"
             if args.fire_mask:
-                plot_fire_mask(df, "FIRMS – Fire detection mask", bbox, out_dir / f"{base_name}_mask.png",
+                plot_fire_mask(df, "FIRMS – Fire detection mask", bbox, visual_dir / f"{base_name}_mask.png",
                               add_basemap=args.basemap, cluster_eps=args.cluster_eps,
-                              cluster_min_samples=args.cluster_min_samples)
+                              cluster_min_samples=args.cluster_min_samples, centroids_dir=dataset_dir)
             if args.time_plot:
-                plot_fire_map_time_based(df, "FIRMS – Time-based", bbox, out_dir / f"{base_name}_time.png", add_basemap=args.basemap)
+                plot_fire_map_time_based(df, "FIRMS – Time-based", bbox, visual_dir / f"{base_name}_time.png", add_basemap=args.basemap)
             if args.plot_points:
-                plot_fire_map(df, "FIRMS – Fire detections", bbox, out_dir / f"{base_name}.png", color_col)
+                plot_fire_map(df, "FIRMS – Fire detections", bbox, visual_dir / f"{base_name}.png", color_col)
+            if args.enrich_earth_engine and HAS_EARTH_ENGINE:
+                ee_start_date, ee_end_date, date_str = _get_fire_date_window(df)
+                export_standalone_ee_feature_datasets(
+                    bbox,
+                    dataset_dir,
+                    visual_dir,
+                    base_name,
+                    date_str=date_str,
+                    start_date=ee_start_date,
+                    end_date=ee_end_date,
+                    add_basemap=args.basemap,
+                    ee_project=getattr(args, "ee_project", None),
+                    fire_df=df,
+                    cluster_eps=args.cluster_eps,
+                    cluster_min_samples=args.cluster_min_samples,
+                )
+            elif args.enrich_earth_engine:
+                print("  WARNING: --enrich-earth-engine ignored. Install: pip install earthengine-api")
+            if getattr(args, "daily_visual_samples", False):
+                export_daily_visual_samples(
+                    df,
+                    bbox,
+                    dataset_dir,
+                    visual_dir,
+                    base_name,
+                    plot_points=args.plot_points,
+                    fire_mask=args.fire_mask,
+                    time_plot=args.time_plot,
+                    add_basemap=args.basemap,
+                    enrich_earth_engine=args.enrich_earth_engine,
+                    ee_raster_layers=ee_raster_layers,
+                    ee_project=getattr(args, "ee_project", None),
+                    start_date=ee_start_date if args.enrich_earth_engine else args.start_date,
+                    end_date=ee_end_date if args.enrich_earth_engine else (args.end_date or args.start_date),
+                    cluster_eps=args.cluster_eps,
+                    cluster_min_samples=args.cluster_min_samples,
+                )
         # EE raster layers (same bbox as fire mask; works with or without FIRMS data)
         if ee_raster_layers:
-            date_str = None
-            if not df.empty and "acq_date" in df.columns:
-                date_str = pd.to_datetime(df["acq_date"]).max().strftime("%Y-%m-%d")
-            if not date_str:
-                date_str = args.end_date or args.start_date or datetime.now().strftime("%Y-%m-%d")
-            extract_and_plot_ee_raster_layers(bbox, ee_raster_layers, out_dir, base_name, date_str=date_str, add_basemap=args.basemap, ee_project=getattr(args, "ee_project", None))
+            ee_start_date, ee_end_date, date_str = _get_fire_date_window(df)
+            extract_and_plot_ee_raster_layers(
+                bbox,
+                ee_raster_layers,
+                dataset_dir,
+                visual_dir,
+                base_name,
+                date_str=date_str,
+                start_date=ee_start_date,
+                end_date=ee_end_date,
+                add_basemap=args.basemap,
+                ee_project=getattr(args, "ee_project", None),
+            )
     else:
         # Multi-area path
         if not df.empty:
             df = add_acq_datetime(df)
             df = add_footprint_columns(df)
-        if args.enrich_earth_engine and HAS_EARTH_ENGINE:
-            df = enrich_with_earth_engine(df, ee_project=getattr(args, "ee_project", None))
-        elif args.enrich_earth_engine:
-            print("  WARNING: --enrich-earth-engine ignored. Install: pip install earthengine-api")
 
         color_col = "frp" if "frp" in df.columns else "bright_ti4"
         for area in args.areas:
             bbox, base_name = _area_bbox_name(area)
+            dataset_dir, visual_dir = get_output_dirs(out_dir, base_name, bbox)
             area_df = subset_bbox(df, bbox) if not df.empty else pd.DataFrame()
             if not area_df.empty:
-                save_outputs(area_df, out_dir, base_name, save_csv=True, save_shp=args.save_shapefile, save_kml=args.save_kml, save_hdf5=args.save_hdf5)
+                save_outputs(area_df, dataset_dir, base_name, save_csv=True, save_shp=args.save_shapefile, save_kml=args.save_kml, save_hdf5=args.save_hdf5)
                 if args.fire_mask:
-                    plot_fire_mask(area_df, f"FIRMS – {area.title()} fire mask", bbox, out_dir / f"{base_name}_mask.png",
+                    plot_fire_mask(area_df, f"FIRMS – {area.title()} fire mask", bbox, visual_dir / f"{base_name}_mask.png",
                                   add_basemap=args.basemap, cluster_eps=args.cluster_eps,
-                                  cluster_min_samples=args.cluster_min_samples)
+                                  cluster_min_samples=args.cluster_min_samples, centroids_dir=dataset_dir)
                 if args.time_plot:
-                    plot_fire_map_time_based(area_df, f"FIRMS – {area.title()} time-based", bbox, out_dir / f"{base_name}_time.png", add_basemap=args.basemap)
+                    plot_fire_map_time_based(area_df, f"FIRMS – {area.title()} time-based", bbox, visual_dir / f"{base_name}_time.png", add_basemap=args.basemap)
                 if args.plot_points:
-                    plot_fire_map(area_df, f"FIRMS – {area.title()}", bbox, out_dir / f"{base_name}.png", color_col)
-            elif not ee_raster_layers:
+                    plot_fire_map(area_df, f"FIRMS – {area.title()}", bbox, visual_dir / f"{base_name}.png", color_col)
+            if args.enrich_earth_engine and HAS_EARTH_ENGINE:
+                ee_start_date, ee_end_date, date_str = _get_fire_date_window(area_df)
+                export_standalone_ee_feature_datasets(
+                    bbox,
+                    dataset_dir,
+                    visual_dir,
+                    base_name,
+                    date_str=date_str,
+                    start_date=ee_start_date,
+                    end_date=ee_end_date,
+                    add_basemap=args.basemap,
+                    ee_project=getattr(args, "ee_project", None),
+                    fire_df=area_df,
+                    cluster_eps=args.cluster_eps,
+                    cluster_min_samples=args.cluster_min_samples,
+                )
+            elif args.enrich_earth_engine:
+                print("  WARNING: --enrich-earth-engine ignored. Install: pip install earthengine-api")
+            if getattr(args, "daily_visual_samples", False):
+                export_daily_visual_samples(
+                    area_df,
+                    bbox,
+                    dataset_dir,
+                    visual_dir,
+                    base_name,
+                    plot_points=args.plot_points,
+                    fire_mask=args.fire_mask,
+                    time_plot=args.time_plot,
+                    add_basemap=args.basemap,
+                    enrich_earth_engine=args.enrich_earth_engine,
+                    ee_raster_layers=ee_raster_layers,
+                    ee_project=getattr(args, "ee_project", None),
+                    start_date=ee_start_date if args.enrich_earth_engine else args.start_date,
+                    end_date=ee_end_date if args.enrich_earth_engine else (args.end_date or args.start_date),
+                    cluster_eps=args.cluster_eps,
+                    cluster_min_samples=args.cluster_min_samples,
+                )
+            if area_df.empty and not args.enrich_earth_engine and not ee_raster_layers:
                 print(f"  No data for {area}, skipping.")
                 continue
             # EE raster layers (same bbox as fire mask per area)
             if ee_raster_layers:
-                date_str = None
-                if not area_df.empty and "acq_date" in area_df.columns:
-                    date_str = pd.to_datetime(area_df["acq_date"]).max().strftime("%Y-%m-%d")
-                if not date_str:
-                    date_str = args.end_date or args.start_date or datetime.now().strftime("%Y-%m-%d")
-                extract_and_plot_ee_raster_layers(bbox, ee_raster_layers, out_dir, base_name, date_str=date_str, add_basemap=args.basemap, ee_project=getattr(args, "ee_project", None))
+                ee_start_date, ee_end_date, date_str = _get_fire_date_window(area_df)
+                extract_and_plot_ee_raster_layers(
+                    bbox,
+                    ee_raster_layers,
+                    dataset_dir,
+                    visual_dir,
+                    base_name,
+                    date_str=date_str,
+                    start_date=ee_start_date,
+                    end_date=ee_end_date,
+                    add_basemap=args.basemap,
+                    ee_project=getattr(args, "ee_project", None),
+                )
 
     print("\nDone. Use the CSV/shapefile outputs for ML feature extraction.")
     print("To export EE training data to GCS: python data_export/export_ee_training_data_main.py -i")
