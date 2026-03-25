@@ -209,7 +209,8 @@ __marimo__/
 # Local Files
 large_data/
 ee_export_config.json
+data output/
 
 *.tfrecord
 *.tfrecord.gz
-exports/
+./exports/
