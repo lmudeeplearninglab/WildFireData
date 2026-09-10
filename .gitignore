@@ -214,3 +214,5 @@ data output/
 *.tfrecord
 *.tfrecord.gz
 ./exports/
+#Misc
+report.txt
