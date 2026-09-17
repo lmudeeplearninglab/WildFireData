@@ -110,9 +110,6 @@ Each owns exactly one kind of decision, so a question has one file to open:
 | `firegrid.py` | *What shape* — projection, resampling, labels, tensors | ~780 |
 | `build_dataset.py` | The driver — sequences the three, handles failure | ~440 |
 
-If your advisor asks why aspect is resampled the way it is, that is
-`firegrid.py` and nothing else. If the answer were spread across a 3,400-line
-script, it would be unauditable.
 
 ### Support scripts
 
