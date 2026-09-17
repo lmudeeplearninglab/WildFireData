@@ -216,3 +216,5 @@ data output/
 ./exports/
 #Misc
 report.txt
+build_report.txt
+**/credentials
