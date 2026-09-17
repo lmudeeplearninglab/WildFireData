@@ -46,8 +46,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import firegrid as F
-import firelookup as L
+import src.firegrid as F
+import src.firelookup as L
 
 V = F.V          # the pipeline module, resolved by version suffix
 

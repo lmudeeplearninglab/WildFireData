@@ -1,0 +1,24 @@
+# Normalize line endings. Development happens on Windows; CI and collaborators
+# may be on Linux. Without this, a file saved by one and edited by the other
+# shows up as entirely rewritten in every diff.
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+
+# Binary — never diff or line-ending-convert these
+*.npz   binary
+*.h5    binary
+*.tif   binary
+*.png   binary
+*.pdf   binary
+
+# Notebooks diff terribly by default. Treat as text but suppress the noise in
+# `git diff`; use nbdime or strip outputs before committing (see CONTRIBUTING).
+*.ipynb text linguist-documentation
+
+# Keep GitHub's language stats about the pipeline, not the reference notebooks
+References/* linguist-vendored

@@ -230,7 +230,7 @@ def step_4_assets(date: str) -> bool:
 def step_5_pipeline_path(project: str, date: str, lon: float, lat: float) -> bool:
     print("\n5. Actual pipeline extraction path")
     try:
-        import firegrid as F
+        import src.firegrid as F
     except ImportError:
         warn("firegrid.py not importable from here",
              "skipping the grid test; run this from the project directory")

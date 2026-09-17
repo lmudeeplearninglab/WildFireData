@@ -3127,7 +3127,7 @@ def resolve_fire_name_args(args) -> bool:
     than not resolving at all.
     """
     try:
-        import firelookup as fl
+        import src.firelookup as fl
     except ImportError:
         print("  --fire-name needs firelookup.py beside this script.")
         return False
