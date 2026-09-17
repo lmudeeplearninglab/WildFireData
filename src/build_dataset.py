@@ -136,13 +136,30 @@ def build_fire(record: L.FireRecord, args, map_key: str) -> dict:
         print(f"  filters     {before:,} -> {len(df):,} detections")
     print(f"  detections  {len(df):,}")
 
-    # --- stage 3: static layers, once ------------------------------------
     out_dir = Path(args.out) / _slug(record)
+
+    # --- visuals, from the detections already fetched --------------------
+    if args.visualize:
+        render_visuals(df, record, envelope, out_dir, args)
+
+    # --- stage 3: static layers, once ------------------------------------
     print("  static layers...")
     static = {} if args.no_ee else fetch_static_layers(
         tile, spec, args.ee_project, start)
     if static:
         print(f"    got {', '.join(sorted(static))}")
+    elif not args.no_ee:
+        # Features were asked for and none arrived. Writing 27 label-only
+        # samples and reporting success would be the wrong outcome: they are
+        # unusable for training and look identical to a good run in the
+        # output directory.
+        print("    NO STATIC LAYERS RETURNED. Every sample would carry only "
+              "prev_fire_mask.")
+        print("    Fix Earth Engine first: python verify_ee_setup.py")
+        if not args.allow_empty_features:
+            return {"fire": record.name, "samples": 0,
+                    "reason": "no Earth Engine features (use "
+                              "--allow-empty-features to write anyway)"}
 
     # --- stages 4-6: one sample per labelled day -------------------------
     all_days = daterange(start, end)
@@ -209,6 +226,66 @@ def build_fire(record: L.FireRecord, args, map_key: str) -> dict:
     return {"fire": record.name, "samples": written, "dir": str(out_dir)}
 
 
+
+def render_visuals(df, record, envelope, out_dir: Path, args) -> None:
+    """Produce the visualize_firms_dataset_v3 outputs for this fire.
+
+    Reuses the DataFrame build_fire already fetched rather than re-querying
+    FIRMS: the detections, bbox and date window are identical, so a second
+    fetch would spend transactions to get the same rows back.
+
+    Everything lands under <out>/<fire>/visuals/, on the same tile envelope the
+    tensors use, so a PNG and a .npz for the same day describe the same ground.
+    """
+    vis_dir = out_dir / "visuals"
+    data_dir = out_dir / "tables"
+    vis_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    base = _slug(record)
+    label = f"{record.name} {record.year or ''}".strip()
+
+    print(f"  visuals -> {vis_dir}")
+    try:
+        V.save_outputs(df, data_dir, base, save_csv=True)
+    except Exception as err:
+        print(f"    tables failed: {err}")
+
+    # Overview plots for the whole window.
+    jobs = [
+        ("points", lambda: V.plot_fire_map(
+            df, f"{label} — detections (FRP)", envelope,
+            vis_dir / f"{base}_points.png")),
+        ("mask", lambda: V.plot_fire_mask(
+            df, f"{label} — fire mask", envelope,
+            vis_dir / f"{base}_mask.png",
+            add_basemap=args.basemap,
+            cluster_eps_km=args.cluster_eps_km,
+            centroids_dir=data_dir)),
+        ("time", lambda: V.plot_fire_map_time_based(
+            df, f"{label} — detections over time", envelope,
+            vis_dir / f"{base}_time.png")),
+    ]
+    for name, job in jobs:
+        try:
+            job()
+        except Exception as err:
+            # One failed plot must not lose the others, or the tensors.
+            print(f"    {name} plot failed: {str(err).splitlines()[0][:120]}")
+
+    if args.daily_visuals:
+        try:
+            start, end = record.date_window(args.lead_in_days, args.tail_days)
+            V.export_daily_visual_samples(
+                df, envelope, data_dir, vis_dir, base,
+                plot_points=True, fire_mask=True,
+                add_basemap=args.basemap,
+                start_date=start, end_date=end,
+                cluster_eps_km=args.cluster_eps_km,
+            )
+        except Exception as err:
+            print(f"    daily visuals failed: {str(err).splitlines()[0][:120]}")
+
+
 def _slug(record: L.FireRecord) -> str:
     name = "".join(c if c.isalnum() else "_" for c in record.name.lower())
     return f"{name}_{record.year or 'unknown'}".strip("_")
@@ -265,12 +342,12 @@ def run_interactive() -> argparse.Namespace:
     args = argparse.Namespace()
 
     print("\n" + "=" * 60)
-    print("  Wildfire Training Dataset ??? Interactive Mode")
+    print("  Wildfire Training Dataset – Interactive Mode")
     print("  (Press Enter to use default where shown)")
     print("=" * 60 + "\n")
 
     # 1. Fires, by name
-    print("1. FIRES (by name ??? no bounding boxes needed)")
+    print("1. FIRES (by name – no bounding boxes needed)")
     year_raw = _prompt("Year (blank = any)", "2025")
     args.year = int(year_raw) if year_raw.strip().isdigit() else None
 
@@ -307,13 +384,35 @@ def run_interactive() -> argparse.Namespace:
     print("   1 = All Earth Engine layers (18 channels)")
     print("   2 = Labels only, no Earth Engine (fast; spends no EE quota)")
     args.no_ee = _prompt("Choice", "1").strip() == "2"
+    args.allow_empty_features = False
     args.ee_project = None
     if not args.no_ee:
         args.ee_project = _prompt("EE project ID",
                                   V.resolve_ee_project()).strip() or None
 
-    # 4. Detection filters
-    print("\n4. DETECTION FILTERS (optional)")
+    # 4. Visual outputs
+    print("\n4. VISUALIZATIONS")
+    print("   Same fire, same tile, same dates as the tensors -- nothing extra")
+    print("   to type, and no second FIRMS fetch.")
+    print("   1 = None (tensors only)")
+    print("   2 = Overview plots + tables  (points, fire mask, time)")
+    print("   3 = Overview + a plot folder for every day")
+    vis_choice = _prompt("Choice", "2").strip()
+    args.visualize = vis_choice in ("2", "3")
+    args.daily_visuals = vis_choice == "3"
+    args.basemap = False
+    args.cluster_eps_km = 2.0
+    if args.visualize:
+        args.basemap = _prompt(
+            "Add a basemap under the plots? (y/n)", "n").lower().startswith("y")
+        eps = _prompt("Cluster radius for the fire mask (km)", "2.0").strip()
+        try:
+            args.cluster_eps_km = float(eps) if eps else 2.0
+        except ValueError:
+            print("  not a number; using 2.0 km")
+
+    # 5. Detection filters
+    print("\n5. DETECTION FILTERS (optional)")
     conf = _prompt("Confidence classes (e.g. n,h; blank = all)", "").strip()
     args.confidence = conf or None
     frp = _prompt("Minimum FRP (blank = none)", "").strip()
@@ -323,8 +422,8 @@ def run_interactive() -> argparse.Namespace:
         print("  not a number; ignoring FRP filter")
         args.min_frp = None
 
-    # 5. Output
-    print("\n5. OUTPUT")
+    # 6. Output
+    print("\n6. OUTPUT")
     args.out = _prompt("Output directory", "ml_dataset")
 
     # 6. Plan, then confirm
@@ -382,6 +481,22 @@ def main() -> int:
     ap.add_argument("--confidence", default=None, help="e.g. n,h")
     ap.add_argument("--min-frp", type=float, default=None)
     ap.add_argument("--ee-project", default=None)
+    ap.add_argument("--visualize", action="store_true",
+                    help="Also write the visualize_firms_dataset_v3 plots and "
+                         "tables for each fire, on the same tile and dates. No "
+                         "bounding box or date typing.")
+    ap.add_argument("--daily-visuals", action="store_true",
+                    help="With --visualize, also write per-day folders of "
+                         "point and mask PNGs")
+    ap.add_argument("--basemap", action="store_true",
+                    help="Add a contextily basemap under the plots")
+    ap.add_argument("--cluster-eps-km", type=float, default=2.0,
+                    help="DBSCAN neighbourhood radius for fire-mask polygons")
+    ap.add_argument("--allow-empty-features", action="store_true",
+                    help="Write samples even when Earth Engine returns nothing. "
+                         "Off by default: label-only samples cannot train a "
+                         "model and are indistinguishable from a good run once "
+                         "written.")
     ap.add_argument("--no-ee", action="store_true",
                     help="Labels only, no feature layers. Useful for checking "
                          "the label pipeline without spending EE quota.")
