@@ -46,8 +46,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import src.firegrid as F
-import src.firelookup as L
+import firegrid as F
+import firelookup as L
 
 V = F.V          # the pipeline module, resolved by version suffix
 
@@ -265,12 +265,12 @@ def run_interactive() -> argparse.Namespace:
     args = argparse.Namespace()
 
     print("\n" + "=" * 60)
-    print("  Wildfire Training Dataset – Interactive Mode")
+    print("  Wildfire Training Dataset ??? Interactive Mode")
     print("  (Press Enter to use default where shown)")
     print("=" * 60 + "\n")
 
     # 1. Fires, by name
-    print("1. FIRES (by name – no bounding boxes needed)")
+    print("1. FIRES (by name ??? no bounding boxes needed)")
     year_raw = _prompt("Year (blank = any)", "2025")
     args.year = int(year_raw) if year_raw.strip().isdigit() else None
 

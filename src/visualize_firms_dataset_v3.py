@@ -75,7 +75,7 @@ FIRMS_SAMPLE_CSV = "https://firms.modaps.eosdis.nasa.gov/content/notebooks/sampl
 
 CALIFORNIA_BBOX = (-124.5, 32.5, -114.1, 42.0)  # west, south, east, north
 EATON_BBOX = (-118.195, 34.148, -118.0, 34.249)
-# 2025 Palisades Fire: Pacific Palisades, Topanga, Malibu (~23,448 acres / 95 km²)
+# 2025 Palisades Fire: Pacific Palisades, Topanga, Malibu (~23,448 acres / 95 km??)
 PALISADES_BBOX = (-118.90, 33.96, -118.38, 34.20)  # west, south, east, north
 
 # NRT = Near Real-Time (~last 10 days). SP = Standard Processing (archive, years of history).
@@ -1214,7 +1214,7 @@ def plot_fire_map_time_based(
         ax.legend(loc="upper left", fontsize=7, ncol=2)
         ax.set_xlabel("Longitude")
         ax.set_ylabel("Latitude")
-        ax.set_title(f"{title} – Fire spread by day ({len(days)} days, {len(df)} detections)")
+        ax.set_title(f"{title} ??? Fire spread by day ({len(days)} days, {len(df)} detections)")
         ax.grid(True, alpha=0.3)
         if add_basemap and HAS_CONTEXTILY and HAS_GEOPANDAS:
             try:
@@ -1277,7 +1277,7 @@ def plot_fire_map_time_based(
         ax.legend(handles=handles, loc="upper left", fontsize=7, ncol=2)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
-    ax.set_title(f"{title} – Fire spread by day ({len(days)} days, {len(df)} footprints)")
+    ax.set_title(f"{title} ??? Fire spread by day ({len(days)} days, {len(df)} footprints)")
     ax.grid(True, alpha=0.3)
 
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -1412,7 +1412,7 @@ def plot_fire_mask(
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
-    ax.set_title(f"{title} – Fire detection mask ({len(gdf)} clusters, {len(df)} detections)")
+    ax.set_title(f"{title} ??? Fire detection mask ({len(gdf)} clusters, {len(df)} detections)")
     ax.grid(True, alpha=0.3)
 
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -1592,7 +1592,7 @@ EE_RASTER_LAYER_CONFIG = {
     "landcover": ("ESA/WorldCover/v100", ["Map"], False, "Land cover"),
     "drought": ("GRIDMET/DROUGHT", ["pdsi"], True, "Drought (PDSI)"),
     "humidity": ("IDAHO_EPSCOR/GRIDMET", ["sph"], True, "Specific humidity (g/kg)"),
-    "weather_temp": ("IDAHO_EPSCOR/GRIDMET", ["tmmx"], True, "Max temperature (°C)"),
+    "weather_temp": ("IDAHO_EPSCOR/GRIDMET", ["tmmx"], True, "Max temperature (??C)"),
     "weather_precip": ("IDAHO_EPSCOR/GRIDMET", ["pr"], True, "Precipitation (mm)"),
     "wind_speed": ("IDAHO_EPSCOR/GRIDMET", ["vs"], True, "Wind speed (m/s)"),
     "wind_direction": ("IDAHO_EPSCOR/GRIDMET", ["th"], True, "Wind direction (deg)"),
@@ -2548,7 +2548,7 @@ def export_standalone_ee_feature_datasets(
     plot_ee_raster_grid(
         layer_results,
         grid_path,
-        title=f"{base_name} – Google Earth Engine features",
+        title=f"{base_name} ??? Google Earth Engine features",
         fire_df=fire_df,
         cluster_eps_km=cluster_eps_km,
         cluster_min_samples=cluster_min_samples,
@@ -2768,7 +2768,7 @@ def export_daily_visual_samples(
         if plot_points or (not fire_mask and not time_plot):
             plot_fire_map(
                 day_df,
-                f"FIRMS – {base_name} {day_str}",
+                f"FIRMS ??? {base_name} {day_str}",
                 bbox,
                 day_visual_dir / f"{day_base}_fire.png",
                 color_col,
@@ -2776,7 +2776,7 @@ def export_daily_visual_samples(
         if fire_mask:
             plot_fire_mask(
                 day_df,
-                f"FIRMS – {base_name} {day_str} fire mask",
+                f"FIRMS ??? {base_name} {day_str} fire mask",
                 bbox,
                 day_visual_dir / f"{day_base}_mask.png",
                 add_basemap=add_basemap,
@@ -2788,7 +2788,7 @@ def export_daily_visual_samples(
         if time_plot:
             plot_fire_map_time_based(
                 day_df,
-                f"FIRMS – {base_name} {day_str} time-based",
+                f"FIRMS ??? {base_name} {day_str} time-based",
                 bbox,
                 day_visual_dir / f"{day_base}_time.png",
                 add_basemap=add_basemap,
@@ -2958,7 +2958,7 @@ def run_interactive() -> argparse.Namespace:
     args.no_verify_key = False
 
     print("\n" + "=" * 60)
-    print("  FIRMS Fire Data – Interactive Mode")
+    print("  FIRMS Fire Data ??? Interactive Mode")
     print("  (Press Enter to use default where shown)")
     print("=" * 60 + "\n")
 
@@ -3127,7 +3127,7 @@ def resolve_fire_name_args(args) -> bool:
     than not resolving at all.
     """
     try:
-        import src.firelookup as fl
+        import firelookup as fl
     except ImportError:
         print("  --fire-name needs firelookup.py beside this script.")
         return False
@@ -3462,16 +3462,16 @@ def main() -> None:
                 )
             color_col = "frp" if "frp" in df.columns else "bright_ti4"
             if args.fire_mask:
-                plot_fire_mask(df, "FIRMS – Fire detection mask", bbox, visual_dir / f"{base_name}_mask.png",
+                plot_fire_mask(df, "FIRMS ??? Fire detection mask", bbox, visual_dir / f"{base_name}_mask.png",
                               add_basemap=args.basemap, cluster_eps_km=args.cluster_eps_km,
                               cluster_min_samples=args.cluster_min_samples,
                               cluster_time_days=args.cluster_time_days,
                               keep_singletons=args.keep_singletons,
                               concave_ratio=args.concave_ratio, centroids_dir=dataset_dir)
             if args.time_plot:
-                plot_fire_map_time_based(df, "FIRMS – Time-based", bbox, visual_dir / f"{base_name}_time.png", add_basemap=args.basemap)
+                plot_fire_map_time_based(df, "FIRMS ??? Time-based", bbox, visual_dir / f"{base_name}_time.png", add_basemap=args.basemap)
             if args.plot_points:
-                plot_fire_map(df, "FIRMS – Fire detections", bbox, visual_dir / f"{base_name}.png", color_col)
+                plot_fire_map(df, "FIRMS ??? Fire detections", bbox, visual_dir / f"{base_name}.png", color_col)
             if args.enrich_earth_engine and HAS_EARTH_ENGINE:
                 export_standalone_ee_feature_datasets(
                     bbox,
@@ -3549,16 +3549,16 @@ def main() -> None:
                         seed=args.seed,
                     )
                 if args.fire_mask:
-                    plot_fire_mask(area_df, f"FIRMS – {area.title()} fire mask", bbox, visual_dir / f"{base_name}_mask.png",
+                    plot_fire_mask(area_df, f"FIRMS ??? {area.title()} fire mask", bbox, visual_dir / f"{base_name}_mask.png",
                                   add_basemap=args.basemap, cluster_eps_km=args.cluster_eps_km,
                                   cluster_min_samples=args.cluster_min_samples,
                                   cluster_time_days=args.cluster_time_days,
                                   keep_singletons=args.keep_singletons,
                                   concave_ratio=args.concave_ratio, centroids_dir=dataset_dir)
                 if args.time_plot:
-                    plot_fire_map_time_based(area_df, f"FIRMS – {area.title()} time-based", bbox, visual_dir / f"{base_name}_time.png", add_basemap=args.basemap)
+                    plot_fire_map_time_based(area_df, f"FIRMS ??? {area.title()} time-based", bbox, visual_dir / f"{base_name}_time.png", add_basemap=args.basemap)
                 if args.plot_points:
-                    plot_fire_map(area_df, f"FIRMS – {area.title()}", bbox, visual_dir / f"{base_name}.png", color_col)
+                    plot_fire_map(area_df, f"FIRMS ??? {area.title()}", bbox, visual_dir / f"{base_name}.png", color_col)
             if args.enrich_earth_engine and HAS_EARTH_ENGINE:
                 export_standalone_ee_feature_datasets(
                     bbox,

@@ -454,7 +454,7 @@ def to_tile(record: FireRecord):
     if not record.centroid:
         return None
     try:
-        import src.firegrid as F
+        import firegrid as F
     except ImportError:
         return None
     return F.snap_tile(record.centroid[0], record.centroid[1])
@@ -470,7 +470,7 @@ def tile_envelope(record: FireRecord) -> tuple[float, float, float, float] | Non
     tile = to_tile(record)
     if tile is None:
         return None
-    import src.firegrid as F
+    import firegrid as F
     return F.tile_bounds_lonlat(tile)
 
 
