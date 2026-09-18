@@ -3,3 +3,17 @@ repos:
     rev: v1.5.0
     hooks:
       - id: detect-secrets
+        # Without --baseline the hook ignores .secrets.baseline entirely:
+        # every audited finding is re-reported on every commit, and the
+        # baseline file itself gets scanned. It stores hashes of findings by
+        # design, so scanning it always produces hits -- an unwinnable loop.
+        args: ['--baseline', '.secrets.baseline']
+        # Transcripts are redacted, but they contain long hex-ish strings
+        # (tile coordinates, paths) that trip the entropy detectors.
+        exclude: |
+          (?x)^(
+            .*build_report\.txt|
+            .*report\.txt|
+            .*\.npz|
+            .*\.ipynb
+          )$
