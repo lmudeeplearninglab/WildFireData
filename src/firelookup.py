@@ -81,6 +81,7 @@ class FireRecord:
     source: str
     exact_footprint: bool           # False when the bbox was inferred
     state: str = ""                 # e.g. "US-CA", when the source reports it
+    geometry: dict | None = None    # GeoJSON perimeter (lon/lat), when published
     dates_uncertain: bool = False   # True when the alarm date was derived
                                     # from the fire year rather than recorded
 
@@ -209,6 +210,7 @@ def search_perimeters(name: str, year: int | None = None,
             centroid=centroid,
             source="FRAP perimeter",
             exact_footprint=True,
+            geometry=feat.get("geometry"),
         ))
     return out
 
@@ -320,6 +322,7 @@ def _arcgis_perimeters(url: str, where: str, out_fields: str, limit: int,
             centroid=((bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2),
             source=source_label,
             exact_footprint=True,
+            geometry=feat.get("geometry"),
             state=str(props.get(state_field, "") or "") if state_field else "",
             dates_uncertain=uncertain,
         ))

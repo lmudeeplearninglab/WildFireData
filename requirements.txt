@@ -1,33 +1,44 @@
-# Core (required)
+# Install with conda for the geospatial stack on Windows -- pip installing over
+# conda-managed binaries is what breaks cffi, cryptography and numpy:
+#
+#   conda create -n wfdata python=3.11
+#   conda activate wfdata
+#   conda install -c conda-forge geopandas shapely rasterio pyproj
+#   pip install -r requirements.txt
+
+# --- Core (required) ---------------------------------------------------------
 numpy>=1.26,<3
 pandas>=2.0,<4
 requests>=2.31
-matplotlib>=3.8,<4          # <3.11 API deprecations already handled
+matplotlib>=3.8,<4
 
-# Geospatial (optional: polygon subsetting, fire-mask polygons, SHP/KML/GeoJSON)
+# --- Geospatial (required by build_dataset / firegrid) ----------------------
 # Pin these together -- the geospatial stack breaks across minor versions more
 # than most.
 geopandas>=1.0,<2
-shapely>=2.1,<3             # 2.1 needed for concave_hull; 2.0 falls back to convex
-rasterio>=1.3,<2            # GeoTIFF output; without it, .npy + bounds.txt fallback
+shapely>=2.1,<3             # 2.1 needed for concave_hull
+rasterio>=1.3,<2            # label rasterization and resampling
+pyproj>=3.6                 # EPSG:3310 tile snapping and reprojection
 
-# Clustering (optional but strongly recommended: without it every detection
-# becomes its own footprint and no cluster labels are produced)
-scikit-learn>=1.3,<2
-
-# Earth Engine (optional)
+# --- Earth Engine (required for feature channels) ---------------------------
 earthengine-api>=0.1.380
 
-# Caching (optional: persists EE results across runs; the single biggest
-# quality-of-life win during development)
-joblib>=1.3
+# --- Clustering (strongly recommended) --------------------------------------
+# Without it every detection becomes its own footprint and fire events cannot
+# be discovered automatically.
+scikit-learn>=1.3,<2
 
-# Basemaps (optional)
-contextily>=1.5
+# --- Training handoff --------------------------------------------------------
+h5py>=3.10                  # export_hdf5.py, swin_data.py
+tables>=3.9                 # HDF5 tables from visualize_firms_dataset_v3
 
-# HDF5 output (optional, for --save-hdf5)
-tables>=3.9
+# --- Optional ----------------------------------------------------------------
+joblib>=1.3                 # caches Earth Engine results across runs
+contextily>=1.5             # basemaps under plots
 
-# Development
+# --- Development -------------------------------------------------------------
 pytest>=8.0
 pyflakes>=3.0
+detect-secrets>=1.5         # pre-commit secret scanning
+pre-commit>=3.5
+nbstripout>=0.7             # strips notebook outputs on commit

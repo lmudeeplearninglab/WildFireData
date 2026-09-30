@@ -46,6 +46,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import firefilter as FF
 import firegrid as F
 import firelookup as L
 
@@ -97,6 +98,58 @@ def fetch_dynamic_layers(tile, spec, ee_project, day: str) -> dict[str, np.ndarr
     return out
 
 
+
+# ---------------------------------------------------------------------------
+# Time steps
+# ---------------------------------------------------------------------------
+def step_windows(start: str, end: str, step: int) -> list:
+    """Window start times, local, aligned to local midnight, covering start..end."""
+    tz = V.LOCAL_TZ
+    first = pd.Timestamp(f"{start} 00:00").tz_localize(tz)
+    last = pd.Timestamp(f"{end} 00:00").tz_localize(tz) + pd.Timedelta(days=1)
+    out, t = [], first
+    while t < last:
+        out.append(t)
+        t = t + pd.Timedelta(hours=step)
+    return out
+
+
+def window_key(ts, step: int) -> str:
+    """Stable key for a window. Daily keeps the old YYYY-MM-DD naming."""
+    return ts.strftime("%Y-%m-%d") if step == 24 else ts.strftime("%Y-%m-%dT%H")
+
+
+def assign_windows(df: pd.DataFrame, start: str, step: int) -> pd.Series:
+    """Map each detection to the key of the window its local time falls in.
+
+    Computed explicitly from local wall-clock hours rather than with
+    Series.dt.floor, which floors tz-aware times against the UTC epoch and
+    would misalign every window by the UTC offset.
+    """
+    if df.empty:
+        return pd.Series(dtype=object, index=df.index)
+    tz = V.LOCAL_TZ
+    if "acq_datetime" in df.columns:
+        t = pd.to_datetime(df["acq_datetime"], utc=True, errors="coerce")
+    else:
+        t = pd.to_datetime(df["acq_date"].astype(str) + " " +
+                           df["acq_time"].astype(float).astype(int).astype(str).str.zfill(4),
+                           format="%Y-%m-%d %H%M", utc=True, errors="coerce")
+    local = t.dt.tz_convert(tz)
+    day = local.dt.strftime("%Y-%m-%d")
+    hour = (local.dt.hour // step) * step
+    if step == 24:
+        return day
+    return day + "T" + hour.astype(int).astype(str).str.zfill(2)
+
+
+def _rewrite_audit_windows(out_dir: Path, record, annotated: pd.DataFrame) -> None:
+    """Re-save the audit CSV with the window column the labels were built on."""
+    path = out_dir / "tables" / f"{_slug(record)}.csv"
+    if path.exists():
+        annotated.to_csv(path, index=False)
+
+
 # ---------------------------------------------------------------------------
 def build_fire(record: L.FireRecord, args, map_key: str) -> dict:
     """Build every sample for one fire. Returns a summary dict."""
@@ -126,21 +179,29 @@ def build_fire(record: L.FireRecord, args, map_key: str) -> dict:
     df = V.add_acq_datetime(df)
     if not all(c in df.columns for c in V.FOOTPRINT_COLUMNS):
         df = V.add_footprint_columns(df)
-    if args.confidence or args.min_frp:
-        before = len(df)
-        df = V.apply_confidence_frp_daynight_filters(
-            df,
-            confidence=tuple(args.confidence.split(",")) if args.confidence else None,
-            min_frp=args.min_frp,
-        )
-        print(f"  filters     {before:,} -> {len(df):,} detections")
-    print(f"  detections  {len(df):,}")
+    if args.min_frp:
+        df = df[pd.to_numeric(df["frp"], errors="coerce") >= args.min_frp]
+
+    # --- decide which detections become labels (firefilter) --------------
+    # Every detection keeps a verdict, so the saved CSV is an audit trail for
+    # the label: rows with used_in_label=True are exactly the ones rasterized.
+    cfg = FF.FilterConfig(
+        min_confidence=args.min_confidence,
+        remove_static=not args.keep_static,
+        target_only=args.target_only,
+    )
+    annotated = FF.annotate(df, cfg, target_bbox=record.bbox,
+                            alarm_date=record.alarm_date)
+    df = annotated[annotated["used_in_label"]].copy()
+    print(f"  quality     {cfg.describe()}")
+    print(FF.summarize(annotated))
 
     out_dir = Path(args.out) / _slug(record)
+    _save_fire_record(out_dir, record, tile, envelope, start, end)
 
     # --- visuals, from the detections already fetched --------------------
     if args.visualize:
-        render_visuals(df, record, envelope, out_dir, args)
+        render_visuals(df, record, envelope, out_dir, args, annotated=annotated)
 
     # --- stage 3: static layers, once ------------------------------------
     print("  static layers...")
@@ -161,65 +222,138 @@ def build_fire(record: L.FireRecord, args, map_key: str) -> dict:
                     "reason": "no Earth Engine features (use "
                               "--allow-empty-features to write anyway)"}
 
-    # --- stages 4-6: one sample per labelled day -------------------------
-    all_days = daterange(start, end)
-    label_days = all_days[args.lead_in_days:]   # lead-in builds prev only
+    # --- stages 4-6: one sample per labelled time step ------------------
+    # A step is a window [t, t + step) in LOCAL time, aligned to local
+    # midnight. step_hours=24 reproduces the original daily behaviour
+    # exactly, including file names, so existing datasets stay comparable.
+    step = int(args.step_hours)
+    per_day = 24 // step
+    to_steps = lambda days: max(1, int(np.ceil(days * per_day)))  # noqa: E731
+
+    windows = step_windows(start, end, step)
+    keys = [window_key(w, step) for w in windows]
+    df = df.assign(window=assign_windows(df, start, step))
+    annotated_windows = assign_windows(annotated, start, step)
+
+    lead_steps = args.lead_in_days * per_day
+    label_keys = keys[lead_steps:]              # lead-in builds prev only
+
+    # Stop once the fire has gone quiet. Meaningful only after static
+    # removal: a refinery lights up every day, so without it a run of blank
+    # steps never occurs and this would never trigger.
+    blank_steps = to_steps(args.stop_after_blank_days) if args.stop_after_blank_days else 0
+    stop_after = FF.blank_run_stop_date(df, keys, blank_steps, date_col="window")
+    if stop_after:
+        dropped = [k for k in label_keys if k > stop_after]
+        label_keys = [k for k in label_keys if k <= stop_after]
+        keys = [k for k in keys if k <= stop_after]
+        windows = windows[:len(keys)]
+        print(f"  stop rule   {args.stop_after_blank_days} blank day(s) "
+              f"({blank_steps} steps) after {stop_after}; "
+              f"{len(dropped)} later step(s) not written")
+
+    # Observation coverage at this step size, measured over the ACTIVE fire
+    # (after the stop rule) -- counting windows long after burnout would make
+    # every step size look worse than it is. With polar orbiters, finer steps
+    # leave most windows with no overpass; those can only be unobserved.
+    active = set(df["window"])
+    live = [k for k in label_keys if k >= min(active)] if active else []
+    observed = sum(1 for k in live if k in active)
+    if step < 24 and live:
+        print(f"  coverage    {observed}/{len(live)} {step}-hour windows observed "
+              f"while the fire was active ({observed / len(live) * 100:.0f}%)")
+
+    # Which windows had a satellite overhead at all. FIRMS reports detections,
+    # not overpasses, so this is inferred from ANY detection in the tile --
+    # including the static sources excluded from the label, which light up on
+    # every pass and therefore make a good overpass witness. A window with no
+    # detection of any kind is treated as unobserved across the whole tile:
+    # nobody looked, so no cell can be labelled "no fire". Conservative -- a
+    # pass that saw nothing at all is also marked unobserved -- which loses a
+    # little data rather than inventing negatives.
+    overpass_keys = set(annotated_windows.dropna())
+
+    max_carry = to_steps(args.max_carry_days)
+    label_set = set(label_keys)
     prev_mask = np.zeros(spec.shape, dtype=np.uint8)
-    carried = 0            # consecutive days prev_mask has been held over
+    carried = 0            # consecutive steps prev_mask has been held over
     written, manifest = 0, []
+    dynamic_cache: dict[str, dict] = {}
 
-    for day in all_days:
-        day_df = df[df["local_date"].astype(str) == day] if "local_date" in df else df.iloc[0:0]
-        fire_mask = F.rasterize_fire_mask(day_df, tile, spec)
+    for win, key in zip(windows, keys):
+        step_df = df[df["window"] == key]
+        fire_mask = F.rasterize_fire_mask(step_df, tile, spec)
         label = F.mark_unobserved(fire_mask, prev_mask,
-                                  day_had_detections=not day_df.empty, spec=spec)
+                                  day_had_detections=not step_df.empty, spec=spec)
+        observed = key in overpass_keys
+        if not observed:
+            label = np.full(spec.shape, F.LABEL_UNOBSERVED, dtype=np.uint8)
+        local_day = win.strftime("%Y-%m-%d")
 
-        if day in label_days:
+        if key in label_set:
             features = dict(static)
             features["prev_fire_mask"] = prev_mask.astype(float)
             if not args.no_ee:
-                features.update(fetch_dynamic_layers(tile, spec, args.ee_project, day))
+                # Zero-order hold: daily products (GRIDMET, drought, NDVI) are
+                # fetched once per local day and held constant across every
+                # sub-daily step in it. Re-fetching per step would return the
+                # same image 24 times at hourly resolution.
+                if local_day not in dynamic_cache:
+                    dynamic_cache[local_day] = fetch_dynamic_layers(
+                        tile, spec, args.ee_project, local_day)
+                features.update(dynamic_cache[local_day])
 
             stack, lab = F.assemble_sample(features, label, spec)
             present = [c for c in F.CHANNELS
                        if c in features and np.isfinite(features[c]).any()]
             meta = {
-                "fire": record.name, "year": record.year, "date": day,
+                "fire": record.name, "year": record.year, "date": local_day,
+                "window_start": key,
+                "window_end": window_key(win + pd.Timedelta(hours=step), step),
+                "step_hours": step,
                 "crs": spec.crs, "cell_m": spec.cell_m,
                 "tile": list(tile), "tile_lonlat": list(envelope),
-                "detections": int(len(day_df)),
+                "detections": int(len(step_df)),
+                "observed": bool(observed),
                 "channels_present": present,
                 "source": record.source,
                 "exact_footprint": record.exact_footprint,
+                "filter": cfg.describe(),
+                "features_hold": "daily layers held (zero-order) across sub-daily steps"
+                                 if step < 24 else "daily",
             }
-            path = F.save_sample(out_dir, f"{_slug(record)}_{day}", stack, lab, meta)
+            path = F.save_sample(out_dir, f"{_slug(record)}_{key}", stack, lab, meta)
             written += 1
             manifest.append({
-                "path": str(path.name), "date": day,
-                "detections": int(len(day_df)),
+                "path": str(path.name), "window_start": key, "date": local_day,
+                "detections": int(len(step_df)),
                 "fire_cells": int((lab == F.LABEL_FIRE).sum()),
                 "unobserved_cells": int((lab == F.LABEL_UNOBSERVED).sum()),
                 "channels_present": len(present),
             })
             flag = "" if present else "   <-- NO FEATURES"
-            print(f"    {day}  {len(day_df):>5,} det  "
+            if not observed:
+                flag += "   (no overpass: all unobserved)"
+            print(f"    {key:<16} {len(step_df):>5,} det  "
                   f"{int((lab == F.LABEL_FIRE).sum()):>5} fire cells  "
                   f"{len(present):>2}/{len(F.CHANNELS)} channels{flag}")
-        else:
-            print(f"    {day}  {len(day_df):>5,} det  (lead-in, not written)")
+        elif step == 24 or not step_df.empty:
+            print(f"    {key:<16} {len(step_df):>5,} det  (lead-in, not written)")
 
         # Carry prev_fire_mask across a coverage gap instead of zeroing it.
-        # A day with no detections anywhere is usually cloud, smoke or a
-        # missed overpass; resetting prev_mask to empty would tell the next
-        # day's sample that nothing was burning, which is the same "learn the
-        # satellite, not the fire" error the unobserved class guards against.
-        # Bounded by --max-carry-days so a fire that genuinely ended does not
-        # propagate forever.
-        if day_df.empty and prev_mask.any() and carried < args.max_carry_days:
+        # At sub-daily steps this matters far more: a 12-hour overpass gap is
+        # 12 blank steps at hourly resolution, and resetting after the first
+        # would claim the fire vanished every afternoon. Bounded by
+        # --max-carry-days (converted to steps) so a real burnout expires.
+        if step_df.empty and prev_mask.any() and carried < max_carry:
             carried += 1
         else:
             prev_mask = (fire_mask > 0).astype(np.uint8)
             carried = 0
+
+    # The CSV audit trail needs the same window keys the labels used.
+    if args.visualize:
+        _rewrite_audit_windows(out_dir, record, annotated.assign(window=annotated_windows))
 
     if manifest:
         (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -227,7 +361,39 @@ def build_fire(record: L.FireRecord, args, map_key: str) -> dict:
 
 
 
-def render_visuals(df, record, envelope, out_dir: Path, args) -> None:
+def _save_fire_record(out_dir: Path, record, tile, envelope, start, end) -> None:
+    """Write the fire's ground truth next to its samples.
+
+    perimeter.geojson is the independent reference the labels are checked
+    against: the agency-mapped burn area, from a different source (ground and
+    aerial mapping) than the satellite detections the labels come from. Saved
+    at build time so verification works offline and always compares against
+    the exact record the dataset was built from.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    props = {
+        "name": record.name, "year": record.year,
+        "alarm_date": record.alarm_date, "contain_date": record.contain_date,
+        "acres": record.acres, "source": record.source,
+        "exact_footprint": record.exact_footprint,
+        "dates_uncertain": record.dates_uncertain,
+        "tile": list(tile), "tile_lonlat": list(envelope),
+        "fetch_window": [start, end],
+    }
+    geom = record.geometry
+    if geom is None and record.bbox:
+        w, s_, e, n = record.bbox
+        geom = {"type": "Polygon",
+                "coordinates": [[[w, s_], [e, s_], [e, n], [w, n], [w, s_]]]}
+        props["geometry_is_bbox"] = True
+    (out_dir / "perimeter.geojson").write_text(json.dumps({
+        "type": "FeatureCollection",
+        "features": [{"type": "Feature", "properties": props, "geometry": geom}],
+    }))
+
+
+def render_visuals(df, record, envelope, out_dir: Path, args,
+                   annotated=None) -> None:
     """Produce the visualize_firms_dataset_v3 outputs for this fire.
 
     Reuses the DataFrame build_fire already fetched rather than re-querying
@@ -246,23 +412,28 @@ def render_visuals(df, record, envelope, out_dir: Path, args) -> None:
 
     print(f"  visuals -> {vis_dir}")
     try:
-        V.save_outputs(df, data_dir, base, save_csv=True)
+        # The CSV holds every detection with its verdict (confidence_class,
+        # drop_reason, used_in_label), not just the survivors -- so you can
+        # see what was excluded and why, and verify_dataset can check that
+        # the used rows reproduce each label exactly.
+        V.save_outputs(annotated if annotated is not None else df,
+                       data_dir, base, save_csv=True)
     except Exception as err:
         print(f"    tables failed: {err}")
 
     # Overview plots for the whole window.
     jobs = [
         ("points", lambda: V.plot_fire_map(
-            df, f"{label} — detections (FRP)", envelope,
+            df, f"{label} -- detections (FRP)", envelope,
             vis_dir / f"{base}_points.png")),
         ("mask", lambda: V.plot_fire_mask(
-            df, f"{label} — fire mask", envelope,
+            df, f"{label} -- fire mask", envelope,
             vis_dir / f"{base}_mask.png",
             add_basemap=args.basemap,
             cluster_eps_km=args.cluster_eps_km,
             centroids_dir=data_dir)),
         ("time", lambda: V.plot_fire_map_time_based(
-            df, f"{label} — detections over time", envelope,
+            df, f"{label} -- detections over time", envelope,
             vis_dir / f"{base}_time.png")),
     ]
     for name, job in jobs:
@@ -342,12 +513,12 @@ def run_interactive() -> argparse.Namespace:
     args = argparse.Namespace()
 
     print("\n" + "=" * 60)
-    print("  Wildfire Training Dataset – Interactive Mode")
+    print("  Wildfire Training Dataset - Interactive Mode")
     print("  (Press Enter to use default where shown)")
     print("=" * 60 + "\n")
 
     # 1. Fires, by name
-    print("1. FIRES (by name – no bounding boxes needed)")
+    print("1. FIRES (by name - no bounding boxes needed)")
     year_raw = _prompt("Year (blank = any)", "2025")
     args.year = int(year_raw) if year_raw.strip().isdigit() else None
 
@@ -378,6 +549,12 @@ def run_interactive() -> argparse.Namespace:
     args.tail_days = int(_prompt("Tail days after containment", "3") or 3)
     args.max_carry_days = int(_prompt(
         "Blank days that keep the previous fire mask alive", "2") or 2)
+    print("   Prediction time step. Finer is faster to act on, but polar")
+    print("   orbiters pass in clusters with gaps up to ~12 h:")
+    print("   (share of windows observed while Eaton was burning)")
+    print("   24 = daily (all)   12 = ~65%   6 = ~45%   1 = ~14% (needs GOES)")
+    step_raw = _prompt("Step in hours (24, 12, 6, 3, 1)", "24").strip()
+    args.step_hours = int(step_raw) if step_raw in {"1", "2", "3", "4", "6", "8", "12", "24"} else 24
 
     # 3. Feature layers
     print("\n3. FEATURE LAYERS")
@@ -412,10 +589,21 @@ def run_interactive() -> argparse.Namespace:
             print("  not a number; using 2.0 km")
 
     # 5. Detection filters
-    print("\n5. DETECTION FILTERS (optional)")
-    conf = _prompt("Confidence classes (e.g. n,h; blank = all)", "").strip()
-    args.confidence = conf or None
-    frp = _prompt("Minimum FRP (blank = none)", "").strip()
+    print("\n5. DETECTION QUALITY (which detections become fire in the label)")
+    print("   Confidence, normalized across VIIRS (l/n/h) and MODIS (0-100):")
+    print("   1 = All      2 = Nominal and high      3 = High only")
+    args.min_confidence = {"1": "low", "3": "high"}.get(
+        _prompt("Choice", "2").strip(), "nominal")
+    print("   Refineries, gas flares and power plants show up as heat every day.")
+    args.keep_static = not _prompt(
+        "Remove static heat sources? (y/n)", "y").lower().startswith("y")
+    args.target_only = _prompt(
+        "Label only the named fire, dropping other fires in the tile? (y/n)",
+        "n").lower().startswith("y")
+    stop = _prompt("Stop after this many consecutive blank days (0 = never)",
+                   "3").strip()
+    args.stop_after_blank_days = int(stop) if stop.isdigit() else 3
+    frp = _prompt("Minimum FRP in MW (blank = none)", "").strip()
     try:
         args.min_frp = float(frp) if frp else None
     except ValueError:
@@ -459,6 +647,11 @@ def run_interactive() -> argparse.Namespace:
     if choice.startswith("n"):
         sys.exit(0)
     args.dry_run = choice.startswith("d")
+    args.verify = False
+    if not args.dry_run:
+        args.verify = _prompt(
+            "Verify the dataset when the build finishes? (y/n)", "y"
+        ).lower().startswith("y")
     return args
 
 
@@ -474,11 +667,27 @@ def main() -> int:
                     help="Days fetched before ignition to seed prev_fire_mask. "
                          "Not written as samples (default 2)")
     ap.add_argument("--tail-days", type=int, default=3)
+    ap.add_argument("--step-hours", type=int, default=24, choices=[1, 2, 3, 4, 6, 8, 12, 24],
+                    help="Prediction time step. 24 = daily (default). With polar-orbiter "
+                         "labels, the Eaton fire was observed in ~65%% of 12-hour "
+                         "windows, ~45%% of 6-hour and ~14%% of 1-hour windows; the "
+                         "rest are labelled unobserved. See the coverage line per fire.")
     ap.add_argument("--max-carry-days", type=int, default=2,
                     help="How many consecutive blank days keep the previous "
                          "fire mask alive before it is treated as burnt out "
                          "(default 2)")
-    ap.add_argument("--confidence", default=None, help="e.g. n,h")
+    ap.add_argument("--min-confidence", default="nominal",
+                    choices=["low", "nominal", "high"],
+                    help="Minimum detection confidence, normalized across VIIRS "
+                         "(l/n/h) and MODIS (0-100). Default nominal.")
+    ap.add_argument("--keep-static", action="store_true",
+                    help="Keep refineries, flares and other persistent heat "
+                         "sources in the label. Off by default.")
+    ap.add_argument("--target-only", action="store_true",
+                    help="Label only the named fire; drop other fires in the tile")
+    ap.add_argument("--stop-after-blank-days", type=int, default=3,
+                    help="Stop writing samples after this many consecutive days "
+                         "with no surviving detections (0 = never). Default 3.")
     ap.add_argument("--min-frp", type=float, default=None)
     ap.add_argument("--ee-project", default=None)
     ap.add_argument("--visualize", action="store_true",
@@ -500,6 +709,9 @@ def main() -> int:
     ap.add_argument("--no-ee", action="store_true",
                     help="Labels only, no feature layers. Useful for checking "
                          "the label pipeline without spending EE quota.")
+    ap.add_argument("--verify", action="store_true",
+                    help="Run verify_dataset (including reality checks and QA "
+                         "sheets) as soon as the build finishes")
     ap.add_argument("--dry-run", action="store_true",
                     help="Resolve fires and print the plan; fetch nothing")
     ap.add_argument("--report-file", default=None, metavar="PATH",
@@ -571,12 +783,35 @@ def main() -> int:
         print(f"  written to {Path(args.out).resolve()}")
         print("=" * 70)
 
+        # Verify inside the transcript, so the build and its verification
+        # live in one report.
+        verified = None
+        if total and getattr(args, "verify", False):
+            verified = run_verification(Path(args.out))
+
     # Outside the with-block: the transcript is closed and complete, so it can
     # be moved without truncating the last lines.
     final = _place_report(staging, Path(args.out))
     if final:
         print(f"Transcript saved: {final}")
+    if verified is False:
+        return 2          # built, but verification found failures
     return 0 if total else 1
+
+
+def run_verification(out_dir: Path) -> bool:
+    """Run verify_dataset on what was just built. True when every check passed."""
+    import verify_dataset
+    print(f"\n{'=' * 70}\nVERIFYING {out_dir}\n{'=' * 70}")
+    saved = sys.argv
+    sys.argv = ["verify_dataset.py", str(out_dir),
+                "--json", str(out_dir / "verification.json")]
+    try:
+        code = verify_dataset.main()
+    finally:
+        sys.argv = saved
+    print(f"\nQA sheets: {out_dir}\\<fire>\\qa\\  -- look at them before training.")
+    return code == 0
 
 
 def _place_report(staging: Path, out_dir: Path) -> Path | None:
