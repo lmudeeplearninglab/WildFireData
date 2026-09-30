@@ -1,36 +1,74 @@
-# Credentials — never commit
+# .gitignore -- WildFireData
+#
+# Rule of thumb: commit CODE and DOCUMENTATION. Never commit credentials,
+# and never commit anything a build produces -- datasets, their reports, plots
+# and verification results travel together with the dataset, not in git.
+
+# --- Credentials: never commit -----------------------------------------------
 .env
+.env.*
 **/credentials
 *.pem
 *.key
+*.p12
+service-account*.json
 
-# Run transcripts. Redacted for credentials, but they record local paths,
+# --- Build outputs -------------------------------------------------------------
+# Any folder a build writes to. build_dataset.py defaults to ml_dataset/;
+# the *_dataset/ pattern catches test_dataset/, eaton_dataset/ and the like.
+ml_dataset/
+*_dataset/
+data output/
+datasets/
+
+# Dataset files, wherever they end up
+*.npz
+*.h5
+*.hdf5
+*.tif
+*.tiff
+*.geojson
+
+# Per-dataset records. Keep them WITH the dataset they describe, not in git:
+# they record local paths, and are meaningless without the data.
+verification.json
+norm_stats.json
+manifest.json
+
+# Run transcripts. Credentials are redacted, but they record local paths,
 # fire names and date ranges.
 report.txt
 report.prev.txt
 build_report.txt
-**/build_report.txt
 
-# Pipeline outputs
-data output/
-ml_dataset/
-datasets/
-*.npz
-*.h5
-*.tif
-*.geojson
-
-# Python
+# --- Python --------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 .pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
 
-# OS
+# --- Editors and OS ------------------------------------------------------------
+# .vscode/settings.json IS committed: it tells the editor where the modules live
+# ("python.analysis.extraPaths": ["./src"]), which stops it rewriting imports
+# as `src.firegrid`. Everything else in .vscode stays local.
+.vscode/*
+!.vscode/settings.json
+.idea/
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# NOTE: .pre-commit-config.yaml and .secrets.baseline SHOULD be committed.
-# The baseline stores hashes of reviewed findings, not secrets; ignoring it
-# makes every contributor re-triage the same findings on every commit.
+# --- Scratch -------------------------------------------------------------------
+*.log
+*.tmp
+*-backup/
+
+# --- Deliberately NOT ignored --------------------------------------------------
+# .pre-commit-config.yaml   shared hook configuration
+# .secrets.baseline         hashes of reviewed findings, not secrets; ignoring
+#                           it makes everyone re-triage the same findings
+# .gitattributes            line-ending rules
+# requirements.txt
