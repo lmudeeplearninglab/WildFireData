@@ -129,6 +129,7 @@ to open.
 | `firelookup.py` | *Where and when*: fire name -> perimeter, dates, tile |
 | `visualize_firms_dataset_v3.py` | FIRMS ingest, dedup, plots, tables, run transcripts |
 | `firefilter.py` | *Which detections count*: confidence, static sources, stop rule |
+| `fireattrib.py` | *Which fire*: names every fire in the tile, `fire_id` maps, fires plot |
 | `firegrid.py` | *What shape*: projection, resampling, labels, tensor layout |
 | `verify_dataset.py` | Checks a built dataset, internally and against reality |
 | `reality_checks.py` | The real-world checks and QA sheets used by `verify_dataset.py` |
@@ -385,12 +386,19 @@ recovered from a coarser dataset later.
 The cost of going finer is observation. Polar-orbiting satellites pass in
 clusters with gaps of up to ~12 hours:
 
-| Step | Windows with a satellite overhead while Eaton burned |
-|---|---|
-| 24 h | all |
-| 12 h | ~65% |
-| 6 h | ~45% |
-| 1 h | ~14% |
+| Step | Windows with a satellite overhead | Windows where it saw fire |
+|---|---|---|
+| 24 h | all | all |
+| 12 h | 94% | 65% |
+| 6 h | 61% | 45% |
+| 3 h | 31% | 23% |
+| 1 h | 20% | 14% |
+
+Measured on the Eaton detections while the fire was active. The first column
+is what matters for labels: a window with no satellite overhead is labelled
+*unobserved* across the whole tile. The second is lower because a satellite
+can pass without seeing the fire -- smoke, cloud, or a lull. Your build prints
+both, for your fire, on the `coverage` line.
 
 Windows with no overpass are labelled **unobserved across the whole tile**:
 nobody looked, so no cell can honestly be labelled "no fire". Hourly steps
@@ -423,6 +431,42 @@ It is assigned in two ways:
 
 `mark_unobserved()` is a heuristic. A per-pixel cloud mask (GOES or MODIS
 MOD35) would do it properly; replace that function, not its callers.
+
+### Which fire? (`fireattrib.py`)
+
+A 64 km tile holds more than the fire you asked for: around Palisades it
+also holds Hurst, Kenneth and a few small unnamed fires. They stay `1` in the
+label -- spread is spread -- but every fire cell also gets a **fire ID**,
+saved beside the label as `fire_id` (64 x 64, uint16):
+
+| `fire_id` | Meaning |
+|---|---|
+| `0` | not fire |
+| `1` | the fire the build was asked for |
+| `2, 3, ...` | other fires, named in `fires.geojson` |
+
+A detection belongs to a fire when it lies within 2 km of that fire's
+agency perimeter during its alarm-to-containment dates. The other fires'
+perimeters come from one extra CAL FIRE query for every perimeter that
+intersects the tile. Detections chained within 2 km of a named fire join it
+(spot fires); the rest become `Unmapped #1, #2, ...` (fires too small to be
+mapped, or not yet in FRAP). If CAL FIRE is unreachable, other fires are
+still separated, just not named; `--no-fire-names` skips the query.
+
+IDs are per build folder. `fires.geojson` is the key: name, kind (target,
+mapped, unmapped), dates, acres, detection count, plot colour, and the
+perimeter or a centre point.
+
+What it changes:
+
+- **`visuals/<fire>_fires.png`**: every fire in its own colour, with its
+  name, dates and detection count.
+- **`qa_labels.png`**: fire cells coloured by fire, other perimeters dashed.
+- **Ground truth** is scored on the named fire only, so Hurst no longer
+  counts against the Palisades perimeter.
+- **Training** decides per experiment: `swin_data.ignore_other_fires()`
+  turns other fires' cells into class 2 (out of the loss) instead of
+  calling them no-fire. Apply it before augmentation.
 
 ---
 
@@ -482,7 +526,9 @@ rows rasterizing to **exactly** each label, cell for cell.
 - terrain identical in every sample; daily layers held within a day
 - **labels against the CAL FIRE perimeter** -- an independent measurement
   from ground and aerial mapping
-- first fire label near the alarm date; no fire on open water
+- first fire label near the alarm date
+- **fire on open water**, with a registration test that separates misaligned
+  labels from detection footprints spilling past a coastline
 - **known events** from the historical record, e.g. the January 2025 Santa
   Ana wind over Palisades and Eaton must point south-west
 
@@ -512,19 +558,21 @@ ml_dataset/
     |-- ...
     |-- manifest.json                per-sample detections, fire and unobserved cells
     |-- perimeter.geojson            the ground truth labels are checked against
+    |-- fires.geojson                key to fire_id: every fire in the tile
     |-- tables/
     |   |-- eaton_2025.csv           every detection, with keep/drop verdict
     |   |-- eaton_2025_centroids.csv
     |   `-- eaton_2025_clusters.geojson
-    |-- visuals/                     overview and per-day plots (--visualize)
+    |-- visuals/                     overview and per-day plots, incl. *_fires.png
     `-- qa/
         |-- qa_labels.png
         `-- qa_channels.png
 ```
 
-Each `.npz` holds `features`, `label`, `channels` and `meta` (fire, date,
-window, step, CRS, tile, detection count, whether a satellite was overhead,
-channels present, and the filter settings used).
+Each `.npz` holds `features`, `label`, `channels`, `fire_id` and `meta`
+(fire, date, window, step, CRS, tile, detection count, whether a satellite was
+overhead, channels present, the filter settings used, and the fires present
+with their cell counts). `firegrid.load_fire_id(path)` reads `fire_id`.
 
 ---
 
@@ -553,6 +601,9 @@ transformer:
 - **Channel types.** Wind and aspect are scaled but never mean-centred;
   `prev_fire_mask` stays 0/1; land cover stays as class codes (one-hot or
   embed it in the model).
+- **Other fires.** `ignore_other_fires(y, fire_id)` removes other fires'
+  cells from the loss for an experiment that should learn from the named
+  fire only. `dataset.h5` carries `/fire_id` and `/meta/fire_names`.
 - **Augmentation rotates the vectors.** Rotating the tile without rotating
   the wind makes wind that blew uphill blow downhill. `augment()` handles all
   16 flips and rotations; `selftest` proves it.
@@ -596,6 +647,10 @@ architecture tuning**, and a plain CNN U-Net is worth training as a baseline.
   driver.
 - **Interactive `getInfo`, not batch export.** Fine for a few fires; a
   statewide build needs `Export.image.toDrive`.
+- **Labels overstate burned area.** Footprints are rasterized with every
+  touched cell; Palisades gives 276 km2 of cells ever burning against a
+  95 km2 perimeter, partly from large MODIS footprints. On a coast this also
+  puts a few labels offshore (reported as a warning).
 - **Known-event checks exist only for Palisades and Eaton.** Add entries to
   `KNOWN_EVENTS` in `reality_checks.py` for other documented fires.
 

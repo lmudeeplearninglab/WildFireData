@@ -1770,14 +1770,22 @@ def _get_ee_image_for_layer(
     start_date: str | None = None,
     end_date: str | None = None,
     time_mode: str = "period",
+    lookback_days: int | None = None,
 ):
-    """Get the EE Image for a raster layer. Returns None if EE is unavailable."""
+    """Get the EE Image for a raster layer. Returns None if EE is unavailable.
+
+    lookback_days, in period mode, sets the window to exactly that many days
+    ending before the label day. Without it the default 30-day lookback is
+    measured back from start_date, so passing a start_date AND relying on the
+    default stacks the two -- which is how a "20-day" drought window became 50.
+    """
     if not HAS_EARTH_ENGINE or layer_key not in EE_RASTER_LAYER_CONFIG:
         return None
     date_str, start_date, end_date, time_mode = _normalize_ee_time_args(
         layer_key, date_str=date_str, start_date=start_date, end_date=end_date, time_mode=time_mode
     )
-    cache_key = (layer_key, date_str, start_date, end_date, time_mode, _FEATURE_LAG_DAYS)
+    cache_key = (layer_key, date_str, start_date, end_date, time_mode,
+                 _FEATURE_LAG_DAYS, lookback_days)
     if cache_key in _EE_IMAGE_CACHE:
         return _EE_IMAGE_CACHE[cache_key]
     dataset, bands, is_time_varying, _ = EE_RASTER_LAYER_CONFIG[layer_key]
@@ -1810,6 +1818,11 @@ def _get_ee_image_for_layer(
                 window_start, window_end = _get_exact_day_window(
                     date_str=date_str, start_date=start_date, end_date=end_date
                 )
+        elif lookback_days:
+            window_start, window_end = _get_time_window(
+                date_str=date_str, end_date=end_date or date_str,
+                lookback_days=int(lookback_days),
+            )
         else:
             window_start, window_end = _get_time_window(
                 date_str=date_str, start_date=start_date, end_date=end_date

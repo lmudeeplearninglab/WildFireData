@@ -66,31 +66,49 @@ UNITS = {
 }
 ESA_WORLDCOVER = {10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100}
 ESA_WATER = 80
+COAST_CELLS = 2          # water within 2 km of a land cell counts as coastline
 STATIC_CHANNELS = ("elevation", "slope", "aspect_sin", "aspect_cos",
                    "aspect_consistency", "landcover", "population")
 DAILY_CHANNELS = ("vegetation", "drought", "humidity", "weather_temp",
                   "weather_precip", "wind_speed", "wind_u", "wind_v", "erc", "vpd")
 
-# Known-answer tests from the historical record. Each is something any
-# report on the event states plainly, so a failure means the DATA is wrong
-# (or the claim is -- check both before trusting either).
+# Known-answer tests from the historical record.
+#
+# RULES FOR ADDING ONE -- the first version of this table broke two of them:
+#   1. The claim must be documented, with a source, at the strength tested.
+#      "No significant rain" is not "no rain": the record said the former,
+#      and a 1 mm threshold tested the latter.
+#   2. The claim must be about the SAME QUANTITY as the channel. "In drought"
+#      was a US Drought Monitor statement; testing it against PDSI, a
+#      different index with months of memory, failed on correct data.
+#   3. The date is the day the CONDITIONS occurred. Features lag the label
+#      by `feature_lag_days`, so conditions on 01-07 are in the sample
+#      labelled 01-08. The check does that mapping; enter the real date.
+# A failure means the data OR the claim is wrong. Check both.
+#
+# Sources (January 2025 Los Angeles fires):
+#   NASA Earth Observatory, "Fuel for California Fires" -- no significant rain
+#     May 2024 to early January 2025; downtown LA had one day in eight months
+#     above a tenth of an inch (2.54 mm).
+#   Wikipedia, "January 2025 Southern California wildfires" (citing NWS) --
+#     Santa Ana winds accelerating the afternoon of January 7 through early
+#     January 8; driest nine months on record before the wind event.
+# Precipitation is tested over the fire (perimeter + 2 km), not the whole
+#   tile: the record is about the burn area, and a 64 km tile reaches into the
+#   San Gabriels, where isolated mountain snow showers were forecast for
+#   2025-01-06 (UCLA weather synopsis). Eaton's tile showed 3.8 mm there.
+# PDSI deliberately absent: the two preceding winters were well above
+# average, and PDSI's long memory can sit near zero or positive in early
+# January despite the Drought Monitor showing moderate drought.
+_LA_JAN_2025 = [
+    ("wind_toward", "2025-01-07", 225.0, 70.0,
+     "Santa Ana: wind from the NE, so vectors point south-west"),
+    ("precip_below", "2025-01-07", 2.54, None,
+     "no rain above a tenth of an inch at the fire before the wind event"),
+]
 KNOWN_EVENTS = {
-    ("PALISADES", 2025): [
-        ("wind_toward", "2025-01-08", 225.0, 70.0,
-         "Santa Ana event: NE wind, so vectors point south-west"),
-        ("precip_below", "2025-01-08", 1.0, None,
-         "no measurable rain during the Santa Ana event"),
-        ("pdsi_below", "2025-01-08", 0.0, None,
-         "Southern California was in drought in January 2025"),
-    ],
-    ("EATON", 2025): [
-        ("wind_toward", "2025-01-08", 225.0, 70.0,
-         "Santa Ana event: NE wind, so vectors point south-west"),
-        ("precip_below", "2025-01-08", 1.0, None,
-         "no measurable rain during the Santa Ana event"),
-        ("pdsi_below", "2025-01-08", 0.0, None,
-         "Southern California was in drought in January 2025"),
-    ],
+    ("PALISADES", 2025): _LA_JAN_2025,
+    ("EATON", 2025): _LA_JAN_2025,
 }
 
 
@@ -290,30 +308,45 @@ def check_ground_truth(samples, fire_dir: Path, rep, F) -> dict:
 
     tile = samples[0]["meta"]["tile"]
     fire_any = np.zeros(F.GRID_SPEC.shape, bool)
+    # With fire IDs, the perimeter is scored against ITS fire only (id 1):
+    # Hurst's cells are not expected near the Palisades perimeter.
+    by_id = all(s.get("fire_id") is not None for s in samples)
+    target = np.zeros(F.GRID_SPEC.shape, bool)
     first_fire = None
     for s in sorted(samples, key=lambda s: s["meta"].get("window_start") or s["meta"]["date"]):
         hit = s["label"] == F.LABEL_FIRE
-        if hit.any() and first_fire is None:
+        mine = (s["fire_id"] == 1) if by_id else hit
+        if mine.any() and first_fire is None:
             first_fire = s["meta"]["date"]
         fire_any |= hit
+        target |= mine
 
     inside = perimeter_on_grid(geometry, tile, F)
     # 2 km covers the VIIRS/MODIS footprint, geolocation error and
     # short-range spotting beyond the final mapped line.
     near = perimeter_on_grid(geometry, tile, F, buffer_m=2000.0)
 
-    n_fire = int(fire_any.sum())
+    n_fire = int(target.sum())
     if n_fire == 0:
-        rep.check(False, "labels contain fire at all")
+        rep.check(False, "labels contain fire at all" if not by_id else
+                  "labels contain the named fire at all",
+                  "" if not by_id else "no detection lies within 2 km of its perimeter "
+                  "during its dates: the wrong fire record, or the perimeter is offset "
+                  "from the detections (see visuals/*_fires.png)")
         return {}
-    in_share = float((fire_any & near).sum() / n_fire)
-    coverage = float((fire_any & inside).sum() / max(1, inside.sum()))
+    if by_id and (fire_any & ~target).any():
+        rep.note(f"{int((fire_any & ~target).sum())} cells belong to other fires in the "
+                 f"tile; the perimeter checks below score the named fire only")
+    whose = "the named fire's" if by_id else "fire"
+    in_share = float((target & near).sum() / n_fire)
+    coverage = float((target & inside).sum() / max(1, inside.sum()))
 
     if in_share >= 0.8:
         rep.check(True, f"labels sit on the mapped burn area: {in_share * 100:.0f}% of "
-                  f"fire cells within 2 km of the {props.get('source', 'agency perimeter')}")
+                  f"{whose} cells within 2 km of the "
+                  f"{props.get('source', 'agency perimeter')}")
     else:
-        rep.warn(f"only {in_share * 100:.0f}% of fire cells are near the mapped perimeter",
+        rep.warn(f"only {in_share * 100:.0f}% of {whose} cells are near the mapped perimeter",
                  "the rest are other fires in the tile or unremoved static sources; "
                  "see the red cells outside the outline on qa_labels.png")
     if coverage >= 0.5:
@@ -341,34 +374,208 @@ def check_ground_truth(samples, fire_dir: Path, rep, F) -> dict:
         rep.note(f"area: perimeter {acres * 0.004047:,.0f} km2, cells ever burning "
                  f"{n_fire} km2 (1 km cells overstate small fires; expect ratio > 1)")
 
-    water = _ch(samples[:1], "landcover")
-    if water is not None:
-        on_water = (fire_any & (water[0] == ESA_WATER)).sum()
-        rep.check(on_water <= max(1, 0.02 * n_fire),
-                  f"no fire on open water ({int(on_water)} cells)",
-                  "" if on_water <= max(1, 0.02 * n_fire) else
-                  "labels and features are misaligned -- fire sits on the ocean")
+    water_stats = check_fire_on_water(samples, fire_dir, fire_any, geometry,
+                                      props, tile, rep, F)
     return {"inside_share": round(in_share, 3), "coverage": round(coverage, 3),
-            "first_fire": first_fire}
+            "first_fire": first_fire, **water_stats}
+
+
+# ---------------------------------------------------------------------------
+# FIRE ON WATER -- misalignment, or footprint spillover?
+# ---------------------------------------------------------------------------
+def _shifted(mask: np.ndarray, dr: int, dc: int):
+    """mask moved by (dr, dc); cells shifted in from outside are marked invalid."""
+    out = np.zeros_like(mask)
+    valid = np.zeros(mask.shape, bool)
+    H, W = mask.shape
+    rs, re_ = max(0, dr), min(H, H + dr)
+    cs, ce = max(0, dc), min(W, W + dc)
+    out[rs:re_, cs:ce] = mask[rs - dr:re_ - dr, cs - dc:ce - dc]
+    valid[rs:re_, cs:ce] = True
+    return out, valid
+
+
+def _audit_rows(fire_dir: Path):
+    """Detections that became fire in the labels, from the audit CSV."""
+    import pandas as pd
+    tables = fire_dir / "tables"
+    csvs = [c for c in sorted(tables.glob("*.csv"))
+            if not c.stem.endswith(("_centroids", "_clusters"))] if tables.is_dir() else []
+    if not csvs:
+        return None
+    df = pd.read_csv(csvs[0])
+    if "used_in_label" in df.columns:
+        df = df[df["used_in_label"].astype(str).str.lower().isin(["true", "1"])]
+    return df
+
+
+def check_fire_on_water(samples, fire_dir, fire_any, geometry, props, tile, rep, F) -> dict:
+    """Fire labels on water: a registration error, or big footprints at a coast?
+
+    Two very different causes look the same in a count:
+      MISALIGNMENT  labels offset from the features. Fatal.
+      SPILLOVER     a coastal fire whose detection footprints, rasterized with
+                    all_touched, reach cells that are mostly sea. MODIS
+                    footprints run to several km across, so this is expected
+                    for any fire that burned to the shore. Not fatal, but it
+                    is fire painted on the ocean, and worth a decision.
+    Evidence gathered to tell them apart:
+      1. Registration: the agency perimeter is drawn in the label frame. Its
+         interior is land by definition. If shifting the land-cover map a few
+         km makes the perimeter sit on land BETTER than no shift does, the
+         frames are offset.
+      2. Detection centres: spillover touches water cells with footprint
+         edges; misalignment puts the detections THEMSELVES on water.
+      3. Which sensor's footprints reach the water cells.
+    """
+    lc = _ch(samples[:1], "landcover")
+    if lc is None:
+        return {}
+    lc = lc[0]
+    # ESA WorldCover maps sea as class 80; beyond its tiles there may be no
+    # data at all. Neither is land.
+    not_land = (lc == ESA_WATER) | ~np.isfinite(lc)
+    land = ~not_land
+    on_water = fire_any & not_land
+    n_fire, n_water = int(fire_any.sum()), int(on_water.sum())
+    if n_water <= max(1, 0.02 * n_fire):
+        rep.check(True, f"no fire on open water ({n_water} cells)")
+        return {"fire_on_water": n_water}
+
+    # Coastal = a land cell within COAST_CELLS. Two, not one: land cover is
+    # resampled by MODE, so a shore cell whose land is split between built-up,
+    # shrub and beach comes out "water" with only a third of it wet, and the
+    # coastline moves about a cell inland. Palisades' 7 "offshore" cells were
+    # exactly that (reproduced against an independent land mask).
+    land_near = np.zeros_like(land)
+    for dr in range(-COAST_CELLS, COAST_CELLS + 1):
+        for dc in range(-COAST_CELLS, COAST_CELLS + 1):
+            land_near |= _shifted(land, dr, dc)[0]
+    coastal = on_water & land_near
+    offshore = on_water & ~land_near
+    stats = {"fire_on_water": n_water, "coastal": int(coastal.sum()),
+             "offshore": int(offshore.sum())}
+    rep.note(f"{n_water} fire cells sit on water/no-land cells: "
+             f"{stats['coastal']} within {COAST_CELLS} km of land, "
+             f"{stats['offshore']} further out")
+
+    # 1. Registration against the perimeter.
+    misaligned = None
+    if geometry is not None and not props.get("geometry_is_bbox"):
+        import rasterio.features
+        from pyproj import Transformer
+        from shapely.geometry import shape, mapping
+        from shapely.ops import transform as shp_transform
+        fwd = Transformer.from_crs("EPSG:4326", F.GRID_SPEC.crs, always_xy=True)
+        poly = shp_transform(lambda x, y, z=None: fwd.transform(x, y), shape(geometry))
+        interior = rasterio.features.rasterize(
+            [(mapping(poly), 1)], out_shape=F.GRID_SPEC.shape,
+            transform=F.tile_transform(tuple(tile)), fill=0,
+            all_touched=False, dtype=np.uint8) > 0
+        if interior.sum() >= 5:
+            scores = {}
+            for dr in range(-3, 4):
+                for dc in range(-3, 4):
+                    moved, valid = _shifted(not_land, dr, dc)
+                    cells = interior & valid
+                    if cells.sum() >= 5:
+                        scores[(dr, dc)] = moved[cells].mean()
+            here = scores.get((0, 0), 1.0)
+            best_shift, best = min(scores.items(), key=lambda kv: kv[1])
+            misaligned = bool(here - best > 0.05)
+            stats["perimeter_interior_on_water"] = round(float(here), 3)
+            rep.check(not misaligned,
+                      f"labels registered to the features: {here * 100:.0f}% of the "
+                      f"perimeter interior is water at zero shift",
+                      "" if not misaligned else
+                      f"shifting land cover by {best_shift} cells (row, col) drops that "
+                      f"to {best * 100:.0f}% -- labels and features are offset")
+
+    # 2 and 3. Attribute the water cells to detections.
+    rows = _audit_rows(fire_dir)
+    centres_offshore = None
+    if rows is not None and len(rows):
+        from pyproj import Transformer
+        fwd = Transformer.from_crs("EPSG:4326", F.GRID_SPEC.crs, always_xy=True)
+        x, y = fwd.transform(rows["longitude"].to_numpy(), rows["latitude"].to_numpy())
+        x0, _, _, y1 = tile
+        c = np.floor((np.asarray(x) - x0) / F.GRID_SPEC.cell_m).astype(int)
+        r = np.floor((y1 - np.asarray(y)) / F.GRID_SPEC.cell_m).astype(int)
+        H, W = F.GRID_SPEC.shape
+        inside = (r >= 0) & (r < H) & (c >= 0) & (c < W)
+        centre_cells = np.zeros(F.GRID_SPEC.shape, bool)
+        centre_cells[r[inside], c[inside]] = True
+        centres_on_water = int((on_water & centre_cells).sum())
+        centres_offshore = int((offshore & centre_cells).sum())
+
+        is_modis = rows["firms_source"].astype(str).str.startswith("MODIS") \
+            if "firms_source" in rows.columns else np.zeros(len(rows), bool)
+        viirs_fp = F.rasterize_fire_mask(rows[~is_modis], tuple(tile)) > 0
+        modis_fp = F.rasterize_fire_mask(rows[is_modis], tuple(tile)) > 0
+        modis_only = on_water & modis_fp & ~viirs_fp
+        stats.update(centres_on_water=centres_on_water,
+                     centres_offshore=centres_offshore,
+                     modis_only=int(modis_only.sum()))
+        rep.note(f"of the {n_water} water cells, {centres_on_water} contain a detection "
+                 f"centre ({centres_offshore} offshore); {int(modis_only.sum())} are "
+                 f"reached only by MODIS footprints")
+        if "scan" in rows.columns and is_modis.any():
+            m = rows[is_modis]
+            rep.note(f"MODIS footprints in this fire reach "
+                     f"{m['scan'].max():.1f} x {m['track'].max():.1f} km; every cell "
+                     f"they touch is labelled fire (all_touched)")
+        all_fp = modis_fp | viirs_fp
+        if all_fp.any():
+            stats["modis_only_fire_share"] = round(
+                float((all_fp & modis_fp & ~viirs_fp).sum() / all_fp.sum()), 3)
+            rep.note(f"{stats['modis_only_fire_share'] * 100:.0f}% of all fire cells "
+                     f"are reached only by MODIS footprints (modis_only_fire_share)")
+
+    if misaligned:
+        return stats                     # already failed, with the shift
+    if centres_offshore:
+        rep.check(False, f"no detections on open water ({centres_offshore} cells "
+                  f"hold a detection centre over {COAST_CELLS} km from land)",
+                  "detections themselves sit on the sea: label/feature offset, or an "
+                  "offshore heat source (platform, ship) that passed the filter")
+        return stats
+    explained = ("registration passes and no detection centre lies offshore"
+                 if misaligned is False and centres_offshore == 0 else
+                 "only partly tested -- rebuild with --visualize so the audit CSV "
+                 "exists" if rows is None else "no detection centre lies offshore")
+    rep.warn(f"{n_water} fire cells on water are footprint spillover at the coast, "
+             f"not misalignment",
+             f"{explained}. Every cell a detection footprint touches is labelled "
+             f"fire, so a fire that burns to the shore paints the first sea cells; "
+             f"MODIS footprints, the largest, reach furthest. These cells teach the "
+             f"model fire on the ocean.")
+    return stats
 
 
 # ---------------------------------------------------------------------------
 # KNOWN EVENTS
 # ---------------------------------------------------------------------------
-def check_known_events(samples, rep) -> None:
+def check_known_events(samples, rep, fire_dir=None, F=None) -> None:
+    from datetime import timedelta
     meta = samples[0]["meta"]
     key = (str(meta.get("fire", "")).upper(), meta.get("year"))
     tests = KNOWN_EVENTS.get(key)
     if not tests:
         return
-    by_day = {}
+    # Older samples do not record the lag; the pipeline default has been 1.
+    lag = int(meta.get("feature_lag_days", 1))
+    by_label_day = {}
     for s in samples:
-        by_day.setdefault(s["meta"].get("date"), s)
+        by_label_day.setdefault(s["meta"].get("date"), s)
     chans = samples[0]["channels"]
+    area = _fire_area(samples, fire_dir, F)
     for kind, day, a, b, why in tests:
-        s = by_day.get(day)
+        label_day = (datetime.strptime(day, "%Y-%m-%d")
+                     + timedelta(days=lag)).strftime("%Y-%m-%d")
+        s = by_label_day.get(label_day)
+        where = f"conditions {day} (sample labelled {label_day}, {lag}-day feature lag)"
         if s is None:
-            rep.note(f"known event {day} not in dataset: {why}")
+            rep.note(f"known event: {where} not in dataset -- {why}")
             continue
         f = s["features"]
         if kind == "wind_toward":
@@ -376,14 +583,38 @@ def check_known_events(samples, rep) -> None:
             v = np.nanmean(f[chans.index("wind_v")])
             heading = float(np.degrees(np.arctan2(u, v)) % 360)
             off = abs((heading - a + 180) % 360 - 180)
-            rep.check(off <= b, f"known event {day}: wind heading {heading:.0f} deg "
+            rep.check(off <= b, f"known event, {where}: wind heading {heading:.0f} deg "
                       f"(expected ~{a:.0f}), {np.hypot(u, v):.1f} m/s -- {why}")
         elif kind == "precip_below":
-            p = float(np.nanmax(f[chans.index("weather_precip")]))
-            rep.check(p < a, f"known event {day}: max precip {p:.1f} mm -- {why}")
-        elif kind == "pdsi_below":
-            d = float(np.nanmean(f[chans.index("drought")]))
-            rep.check(d < a, f"known event {day}: PDSI {d:+.1f} -- {why}")
+            pr = f[chans.index("weather_precip")]
+            p = float(np.nanmax(pr[area] if area is not None else pr))
+            scope = "over the fire" if area is not None else "in the tile"
+            rep.check(p < a, f"known event, {where}: wettest cell {scope} {p:.1f} mm "
+                      f"(limit {a:g}) -- {why}")
+            if area is not None and np.nanmax(pr) > p:
+                r, c = np.unravel_index(np.nanargmax(pr), pr.shape)
+                lat, lon = _cell_latlon(samples[0]["meta"]["tile"], r, c, F)
+                rep.note(f"wettest cell in the whole tile: {np.nanmax(pr):.1f} mm at "
+                         f"({lat:.2f}, {lon:.2f}), outside the fire area")
+
+
+def _fire_area(samples, fire_dir, F):
+    """Cells within 2 km of the agency perimeter, or None if there is none."""
+    if fire_dir is None or F is None:
+        return None
+    geometry, props = _load_perimeter(Path(fire_dir))
+    if geometry is None or props.get("geometry_is_bbox"):
+        return None
+    area = perimeter_on_grid(geometry, samples[0]["meta"]["tile"], F, buffer_m=2000.0)
+    return area if area.any() else None
+
+
+def _cell_latlon(tile, r, c, F):
+    from pyproj import Transformer
+    inv = Transformer.from_crs(F.GRID_SPEC.crs, "EPSG:4326", always_xy=True)
+    cell = F.GRID_SPEC.cell_m
+    lon, lat = inv.transform(tile[0] + (c + 0.5) * cell, tile[3] - (r + 0.5) * cell)
+    return lat, lon
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +636,16 @@ def _perimeter_pixels(geometry, tile, F):
     return rings
 
 
+def _label_rgba(label, fire_id, FA) -> np.ndarray:
+    """Label as an image: fire cells in their fire's colour, unobserved grey."""
+    from matplotlib.colors import to_rgba
+    img = np.zeros(label.shape + (4,))
+    img[label == 2] = (0.55, 0.55, 0.6, 0.55)
+    for v in np.unique(fire_id[fire_id > 0]):
+        img[fire_id == v] = to_rgba(FA.fire_color(int(v)))
+    return img
+
+
 def draw_qa(samples, fire_dir: Path, F, max_panels: int = 30) -> list[Path]:
     import matplotlib
     matplotlib.use("Agg")
@@ -417,6 +658,12 @@ def draw_qa(samples, fire_dir: Path, F, max_panels: int = 30) -> list[Path]:
     tile = samples[0]["meta"]["tile"]
     rings = _perimeter_pixels(geometry, tile, F) \
         if geometry and not props.get("geometry_is_bbox") else []
+    # Other mapped fires in the tile, outlined dashed in their own colour.
+    import fireattrib as FA
+    fires = FA.load_fires(fire_dir)
+    others = [(f, _perimeter_pixels(f["geometry"], tile, F)) for f in fires
+              if f["kind"] == "mapped" and f.get("geometry", {}).get("type")
+              in ("Polygon", "MultiPolygon")]
     elev = _ch(samples[:1], "elevation")
     shade = None
     if elev is not None and np.isfinite(elev).any():
@@ -444,16 +691,35 @@ def draw_qa(samples, fire_dir: Path, F, max_panels: int = 30) -> list[Path]:
             ax.imshow(shade, cmap="gray", vmin=0, vmax=1)
         prev = np.nan_to_num(s["features"][pm_i]) > 0
         ax.contour(prev, levels=[0.5], colors="orange", linewidths=0.6)
-        ax.imshow(s["label"], cmap=cmap, vmin=0, vmax=2, interpolation="nearest")
+        if s.get("fire_id") is None:
+            ax.imshow(s["label"], cmap=cmap, vmin=0, vmax=2, interpolation="nearest")
+        else:
+            ax.imshow(_label_rgba(s["label"], s["fire_id"], FA), interpolation="nearest")
         for cx, cy in rings:
             ax.plot(cx, cy, color="cyan", lw=0.8)
+        for f, frings in others:
+            for cx, cy in frings:
+                ax.plot(cx, cy, color=f["color"], lw=0.7, ls="--")
         key = s["meta"].get("window_start") or s["meta"]["date"]
         ax.set_title(f"{key}\n{s['meta'].get('detections', '?')} det, "
                      f"{int((s['label'] == 1).sum())} fire", fontsize=7)
+    present = sorted({int(v) for s in ordered if s.get("fire_id") is not None
+                      for v in np.unique(s["fire_id"]) if v})
+    fire_key = ("fire label, coloured by fire (key below)" if len(present) > 1
+                else "red: fire label")
     fig.suptitle(f"{samples[0]['meta'].get('fire')} {samples[0]['meta'].get('year')} -- "
-                 "red: fire label   grey: unobserved   orange: prev_fire_mask   "
+                 f"{fire_key}   grey: unobserved   orange: prev_fire_mask   "
                  "cyan: agency perimeter", fontsize=9)
-    fig.tight_layout()
+    if len(present) > 1:
+        from matplotlib.patches import Patch
+        names = {f["fire_id"]: f["name"] for f in fires}
+        fig.legend(handles=[Patch(color=FA.fire_color(v),
+                                  label=f"{v} {names.get(v, '?')}") for v in present[:12]],
+                   loc="lower center", ncol=min(6, len(present)), fontsize=7,
+                   frameon=False, title="fire label colour = fire_id (dashed: its perimeter)",
+                   title_fontsize=7)
+    foot = 0.0 if len(present) < 2 else 0.5 + 0.2 * ((len(present[:12]) - 1) // 6)
+    fig.tight_layout(rect=(0, foot / fig.get_size_inches()[1], 1, 1))
     labels_png = qa / "qa_labels.png"
     fig.savefig(labels_png, dpi=110)
     plt.close(fig)
@@ -507,7 +773,7 @@ def run(samples, fire_dir: Path, rep, F, plots: bool = True) -> dict:
     check_wind(samples, rep)
     check_static_and_hold(samples, rep)
     truth = check_ground_truth(samples, fire_dir, rep, F)
-    check_known_events(samples, rep)
+    check_known_events(samples, rep, fire_dir, F)
     if plots:
         try:
             for p in draw_qa(samples, fire_dir, F):

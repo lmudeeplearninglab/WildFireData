@@ -99,6 +99,7 @@ def load_all(root: Path, F) -> dict[str, list[dict]]:
         groups[path.parent.name].append({
             "path": path, "features": features, "label": label,
             "channels": list(channels), "meta": meta,
+            "fire_id": F.load_fire_id(path),
         })
     return groups
 
@@ -359,6 +360,59 @@ def check_tile_overlap(groups: dict[str, list[dict]], rep: Report) -> None:
 
 
 # ---------------------------------------------------------------------------
+def check_fire_ids(samples: list[dict], rep: Report, F) -> dict:
+    """Fire IDs (fireattrib) agree with the labels, the key and the CSV.
+
+    Three things must hold: every fire cell has an ID and no other cell does;
+    every ID is named in fires.geojson; and each window's ID map rebuilds
+    exactly from the audit CSV's fire_id column. Returns cells per fire.
+    """
+    import fireattrib as FA
+    have = [s for s in samples if s.get("fire_id") is not None]
+    if not have:
+        rep.note("no fire_id maps (built before fire naming); per-fire checks skipped")
+        return {}
+    fire_dir = samples[0]["path"].parent
+    key = {f["fire_id"]: f["name"] for f in FA.load_fires(fire_dir)}
+    off = [s["meta"].get("window_start") or s["meta"].get("date") for s in have
+           if not np.array_equal(s["fire_id"] > 0, s["label"] == F.LABEL_FIRE)]
+    rep.check(not off, f"every fire cell carries a fire_id, and only fire cells "
+              f"({len(have)} samples)", ("mismatch at " + ", ".join(off[:4])) if off else "")
+    seen = sorted({int(v) for s in have for v in np.unique(s["fire_id"]) if v})
+    unknown = [v for v in seen if v not in key]
+    rep.check(not unknown, f"every fire_id is named in fires.geojson ({len(key)} fires)",
+              f"ids without a name: {unknown}" if unknown else "")
+
+    # Cells ever burning, per fire.
+    totals = {}
+    for v in seen:
+        ever = np.zeros(F.GRID_SPEC.shape, bool)
+        for s in have:
+            ever |= s["fire_id"] == v
+        totals[key.get(v, f"#{v}")] = int(ever.sum())
+    rep.note("cells ever burning by fire: " + ", ".join(
+        f"{v} {n}" for v, n in sorted(totals.items(), key=lambda kv: -kv[1])))
+
+    import pandas as pd
+    csvs = [c for c in sorted((fire_dir / "tables").glob("*.csv"))
+            if not c.stem.endswith(("_centroids", "_clusters"))] \
+        if (fire_dir / "tables").is_dir() else []
+    if csvs:
+        df = pd.read_csv(csvs[0])
+        if "fire_id" in df.columns and "window" in df.columns:
+            used = df[df["used_in_label"].astype(str).str.lower().isin(["true", "1"])]
+            bad = []
+            for s in have:
+                key_w = s["meta"].get("window_start") or s["meta"].get("date")
+                rebuilt = FA.fire_id_map(used[used["window"].astype(str) == key_w],
+                                         tuple(s["meta"]["tile"]), F.GRID_SPEC)
+                if not np.array_equal(rebuilt, s["fire_id"]):
+                    bad.append(key_w)
+            rep.check(not bad, f"CSV fire_id column rebuilds every fire_id map "
+                      f"({len(have)} windows)", ", ".join(bad[:4]))
+    return totals
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -400,11 +454,12 @@ def main() -> int:
         stats = check_content(samples, rep, F)
         check_prev_mask_chain(samples, rep, F)
         check_csv_correspondence(samples, rep, F)
+        by_fire = check_fire_ids(samples, rep, F)
         print(f"\n{INFO} -- against the real world --")
         truth = RC.run(samples, samples[0]["path"].parent, rep, F,
                        plots=not args.no_plots)
         per_fire[fire] = {"samples": len(samples), "dates": dates, **stats,
-                          "ground_truth": truth}
+                          "cells_by_fire": by_fire, "ground_truth": truth}
         print()
 
     print("-" * 72)
@@ -414,18 +469,31 @@ def main() -> int:
 
     # The temporal footprint is reported rather than asserted, because it is
     # deliberately not uniform: the products have different cadences.
+    # Read the step and lag from the samples themselves, so the summary
+    # describes THIS dataset rather than the default configuration.
+    metas = [smp["meta"] for group in groups.values() for smp in group]
+    steps = sorted({int(m.get("step_hours", 24)) for m in metas})
+    lags = sorted({int(m.get("feature_lag_days", 1)) for m in metas})
+    step = steps[0] if len(steps) == 1 else None
+    lag = lags[0] if len(lags) == 1 else None
+    unit = ("1 local day" if step == 24 else f"{step} hours" if step
+            else f"mixed steps {steps} h")
+    lag_txt = (f"ending {lag} day(s) before the label" if lag is not None
+               else f"lags {lags} d")
     print(f"\n{INFO} temporal footprint per channel (not uniform by design):")
     for ch in F.CHANNELS:
         if ch == "prev_fire_mask":
-            window = "1 day (t-1)"
+            window = f"previous step ({unit} earlier)"
         elif ch in ("elevation", "slope", "landcover", "population") or ch.startswith("aspect"):
             window = "static"
         else:
             lb = F.LAYER_LOOKBACK_DAYS.get(ch)
-            window = f"{lb}-day window" if lb else "1 day"
+            window = (f"{lb}-day window" if lb else "1 day") + f", {lag_txt}"
+            if step and step < 24:
+                window += f"; held across the day's {24 // step} steps"
         print(f"{INFO}   {ch:<20} {window}")
-    print(f"{INFO} labels are exactly one local calendar day; state this in "
-          f"any methods write-up.")
+    print(f"{INFO} each label covers {unit} of detections, in local time; state "
+          f"this and the feature lag in any methods write-up.")
 
     print("\n" + "=" * 72)
     if rep.failures:

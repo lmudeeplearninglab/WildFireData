@@ -148,6 +148,21 @@ def normalize(x: np.ndarray, stats: dict) -> np.ndarray:
     return out
 
 
+def ignore_other_fires(y: np.ndarray, fire_id: np.ndarray,
+                       keep: tuple[int, ...] = (1,)) -> np.ndarray:
+    """Label with other fires' cells set to IGNORE_INDEX.
+
+    Labels keep every fire as fire, because spread is spread. This is the
+    switch for an experiment that should learn from the named fire only:
+    cells of other fires (fire_id not in `keep`) drop out of the loss instead
+    of being called no-fire, which would be false. Apply BEFORE augment(),
+    so fire_id never needs rotating.
+    """
+    out = np.array(y, copy=True)
+    out[(fire_id > 0) & ~np.isin(fire_id, keep)] = IGNORE_INDEX
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 4. Direction-aware augmentation
 # ---------------------------------------------------------------------------
@@ -248,6 +263,15 @@ def test_augmentation() -> None:
           f"-- the wind ends up blowing downhill")
 
 
+def test_ignore_other_fires() -> None:
+    y = np.array([[1, 1, 0], [0, 2, 1]], dtype=np.uint8)
+    fid = np.array([[1, 3, 0], [0, 0, 2]], dtype=np.uint16)
+    got = ignore_other_fires(y, fid)
+    assert got.tolist() == [[1, 2, 0], [0, 2, 2]], got
+    assert ignore_other_fires(y, fid, keep=(1, 2, 3)).tolist() == y.tolist()
+    print("  ignore_other_fires: other fires leave the loss, the named fire stays")
+
+
 def test_normalization() -> None:
     channels = ["elevation", "wind_u", "wind_v", "landcover", "prev_fire_mask"]
     rng = np.random.default_rng(0)
@@ -293,6 +317,7 @@ def main() -> int:
     if args.cmd == "selftest":
         test_augmentation()
         test_normalization()
+        test_ignore_other_fires()
         return 0
 
     import h5py

@@ -586,5 +586,99 @@ def main() -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Every mapped fire in an area -- used to name the OTHER fires in a tile
+# ---------------------------------------------------------------------------
+def perimeters_in_area(bbox: tuple[float, float, float, float],
+                       year: int | None, start: str | None = None,
+                       end: str | None = None, limit: int = 200
+                       ) -> list[FireRecord]:
+    """All mapped perimeters that intersect `bbox` and burned during start..end.
+
+    A spatial query, not a name query: the tile around Palisades also holds
+    Hurst and Kenneth, and nobody asked for those by name. FRAP first (real
+    dates), then NIFC history if FRAP is unreachable. The fire year and the
+    one before are both asked for, so a fire that started in late December
+    and burned into the window is not missed; the date filter then keeps
+    only fires whose alarm..containment span overlaps the window.
+    """
+    w, s, e, n = bbox
+    years = sorted({int(year) - 1, int(year)}) if year else []
+    spatial = {
+        "geometry": f"{w},{s},{e},{n}", "geometryType": "esriGeometryEnvelope",
+        "inSR": "4326", "spatialRel": "esriSpatialRelIntersects",
+        "returnGeometry": "true", "outSR": "4326", "f": "geojson",
+        "resultRecordCount": limit,
+    }
+    try:
+        where = (f"YEAR_ IN ({', '.join(map(str, years))})" if years else "1=1")
+        resp = requests.get(FRAP_URL, timeout=TIMEOUT, params={
+            **spatial, "where": where,
+            "outFields": "FIRE_NAME,YEAR_,ALARM_DATE,CONT_DATE,GIS_ACRES"})
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            raise RuntimeError(data["error"])
+        records = []
+        for feat in data.get("features", []):
+            props = feat.get("properties") or {}
+            bounds = _ring_bounds(feat.get("geometry") or {})
+            if not bounds:
+                continue
+            records.append(FireRecord(
+                name=str(props.get("FIRE_NAME", "")).strip() or "UNNAMED",
+                year=int(props["YEAR_"]) if props.get("YEAR_") else None,
+                alarm_date=_epoch_to_date(props.get("ALARM_DATE")),
+                contain_date=_epoch_to_date(props.get("CONT_DATE")),
+                acres=float(props["GIS_ACRES"]) if props.get("GIS_ACRES") else None,
+                bbox=bounds,
+                centroid=((bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2),
+                source="FRAP perimeter", exact_footprint=True,
+                geometry=feat.get("geometry")))
+    except Exception as err:
+        print(f"  FRAP area query failed ({err}); trying NIFC")
+        where = (f"FIRE_YEAR IN ({', '.join(repr(str(y)) for y in years)})"
+                 if years else "1=1")
+        resp = requests.get(NIFC_HISTORY_URL, timeout=TIMEOUT, params={
+            **spatial, "where": where,
+            "outFields": "INCIDENT,FIRE_YEAR,GIS_ACRES,DATE_CUR"})
+        resp.raise_for_status()
+        records = [r for r in _nifc_from_geojson(resp.json())]
+    return [r for r in records if _overlaps(r, start, end)]
+
+
+def _nifc_from_geojson(data: dict):
+    if "error" in data:
+        raise RuntimeError(f"NIFC query failed: {data['error']}")
+    for feat in data.get("features", []):
+        props = feat.get("properties") or {}
+        bounds = _ring_bounds(feat.get("geometry") or {})
+        if not bounds:
+            continue
+        year = props.get("FIRE_YEAR")
+        yield FireRecord(
+            name=str(props.get("INCIDENT", "")).strip() or "UNNAMED",
+            year=int(year) if str(year or "").isdigit() else None,
+            alarm_date=None, contain_date=None,
+            acres=float(props["GIS_ACRES"]) if props.get("GIS_ACRES") else None,
+            bbox=bounds,
+            centroid=((bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2),
+            source="NIFC perimeter history", exact_footprint=True,
+            geometry=feat.get("geometry"), dates_uncertain=True)
+
+
+def _overlaps(record: FireRecord, start: str | None, end: str | None) -> bool:
+    """Did this fire burn at some point between start and end?
+
+    No alarm date (NIFC history often has none) means unknown, which is kept:
+    the attribution step still requires detections to fall inside the
+    perimeter, so a wrong-year polygon can only name detections at its spot.
+    """
+    if not (start and end and record.alarm_date):
+        return True
+    finish = record.contain_date or end
+    return record.alarm_date <= end and finish >= start
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

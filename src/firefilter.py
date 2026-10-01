@@ -116,6 +116,11 @@ def _cells(df: pd.DataFrame, deg: float) -> pd.Series:
                     (df["longitude"] / deg).round().astype(int)))
 
 
+def _inside(df: pd.DataFrame, bbox) -> pd.Series:
+    w, s, e, n = bbox
+    return df["longitude"].between(w, e) & df["latitude"].between(s, n)
+
+
 def find_static_cells(df: pd.DataFrame, cfg: FilterConfig,
                       protect_bbox: tuple | None = None,
                       alarm_date: str | None = None) -> dict:
@@ -204,8 +209,25 @@ def annotate(df: pd.DataFrame, cfg: FilterConfig,
         cells = pd.Series(_cells(out, cfg.static_cell_deg), index=out.index)
         hot = pd.to_numeric(out.get("frp"), errors="coerce").fillna(0) \
             >= cfg.keep_frp_above
-        for idx in out.index[(reason == "") & cells.isin(static.keys()) & ~hot]:
-            reason[idx] = static[cells[idx]]
+        # A site straddles cell edges: 84 of 85 Torrance refinery rows fell in
+        # flagged cells, and the one that landed next door became "fire".
+        # Outside the named fire, a static cell's 8 neighbours count too, but
+        # only at the site's own power (<= 2x its median FRP): a 5 MW Hurst
+        # Fire pixel beside a landfill is fire, not the landfill.
+        frp = pd.to_numeric(out.get("frp"), errors="coerce")
+        site_frp = frp.groupby(cells).median()
+        ring: dict = {}
+        for (r, c), why in static.items():
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    lim = 2 * site_frp.get((r, c), 0)
+                    if lim > ring.get((r + dr, c + dc), ("", -1))[1]:
+                        ring[(r + dr, c + dc)] = (why, lim)
+        outside = ~_inside(out, target_bbox) if target_bbox else True
+        lim = cells.map(lambda k: ring.get(k, ("", -1))[1])
+        match = cells.isin(static.keys()) | ((frp <= lim) & outside)
+        for idx in out.index[(reason == "") & match & ~hot]:
+            reason[idx] = static.get(cells[idx]) or ring[cells[idx]][0]
 
     # target fire isolation
     if cfg.target_only and target_bbox is not None:

@@ -83,17 +83,23 @@ firefighters is decided here, not in the model code.
 
 The percentages on screen are the cost of going finer:
 
-| Step | Share of windows with a satellite overhead while Eaton burned |
-|---|---|
-| 24 h | all |
-| 12 h | ~65% |
-| 6 h | ~45% |
-| 1 h | ~14% |
+| Step | Windows with a satellite overhead | Windows where it saw fire |
+|---|---|---|
+| 24 h | all | all |
+| 12 h | 94% | 65% |
+| 6 h | 61% | 45% |
+| 3 h | 31% | 23% |
+| 1 h | 20% | 14% |
+
+Measured on the Eaton detections while the fire was active. The first column
+is what matters for labels: a window with no satellite overhead is labelled
+*unobserved* across the whole tile. The second is lower because a satellite
+can pass without seeing the fire -- smoke, cloud, or a lull. Your build prints
+both, for your fire, on the `coverage` line.
 
 Polar-orbiting satellites pass in clusters, with gaps of up to ~12 hours.
-Windows with no overpass are labelled *unobserved* across the whole tile and
-contribute nothing to training. Hourly steps need a geostationary source such
-as GOES before they are practical.
+Unobserved windows contribute nothing to training. Hourly steps need a
+geostationary source such as GOES before they are practical.
 
 Earth Engine cost does not grow with a finer step: the daily weather,
 drought and vegetation layers are fetched once per day and held constant
@@ -151,8 +157,29 @@ train on this dataset.** A `[warn]` means look at the QA sheet and decide.
 | **labels sit on the mapped burn area** | fire cells fall on the agency perimeter | static sources left in, or other fires in the tile |
 | **labels cover the burn area** | the fire was actually captured | missing days, over-filtering |
 | first fire label matches alarm date | timing is right | days missing, or fire in the tile before ignition |
-| no fire on open water | labels and features are aligned | labels are offset from the features |
+| fire on open water | labels and features are aligned (registration test) | labels are offset from the features |
 | **known events** | conditions match the historical record | the data, or the recorded claim, is wrong |
+
+**Fire on open water** is a `[warn]`, not a `[FAIL]`, for a fire that burned
+to the coast. A satellite detection is a footprint -- up to 3.4 x 1.7 km for
+MODIS -- and every 1 km cell it touches is labelled fire, so a detection on
+the beach also labels the first offshore cell. The check separates that from
+real misalignment by sliding the perimeter up to 3 cells in every direction
+over the land-cover water: if the unshifted grid fits best, the data is
+aligned. It also reports which sensor the offshore cells came from and
+whether any detection *centre* is offshore. It fails only when a shift fits
+better, or when detection centres sit more than 2 km from any land cell.
+
+The 2 km allowance is deliberate. Land cover is resampled by majority class,
+so a shore cell whose land is split between built-up, shrub and beach can come
+out "water" while mostly land, which moves the coastline about a cell inland.
+On Palisades, 22 low-power detections from 8 January sat about a kilometre off
+the Malibu shore and were wrongly failed with a 1 km allowance.
+
+**Known events** are dated by the conditions, not the label. Features lag the
+label by one day, so the Santa Ana wind of 2025-01-07 is tested on the
+2025-01-08 sample. Each claim and its source is in `KNOWN_EVENTS` in
+`reality_checks.py`.
 
 The perimeter is the strongest check. It comes from CAL FIRE's ground and
 aerial mapping -- a completely different measurement from the satellite
@@ -172,6 +199,12 @@ Fire near Acton -- which is real fire, not an error. The rest were scattered
 single cells. `--target-only` excludes other fires if the model should learn
 one fire at a time.
 
+**Other fires are now named, and scored separately.** The build prints a
+`fires` roll call: every fire in the tile with its ID, detection count,
+dates and source. The perimeter checks score fire 1 only, and the verifier
+notes how many cells belong to other fires. Expect the "near the perimeter"
+share to rise once other fires stop counting against it.
+
 ## 4. Look at the QA sheets
 
 Every fire gets two images in `ml_dataset\<fire>\qa\`. **Open them before
@@ -179,13 +212,23 @@ training.** They take a minute and catch things no automated check can.
 
 ### `qa_labels.png` -- one panel per step
 
-Red = fire label, grey = unobserved, orange outline = the previous step's
-fire (what the model is given), cyan = the agency perimeter.
+Fire cells are coloured by fire: red = the fire you built, other colours =
+other fires (key at the bottom, dashed outlines = their perimeters). Grey =
+unobserved, orange outline = the previous step's fire (what the model is
+given), cyan = the agency perimeter.
 
 - [ ] The red sits inside or against the cyan outline
 - [ ] The fire grows, then shrinks, in a plausible order
-- [ ] The orange outline in each panel matches the red of the panel before
-- [ ] Red cells far from the outline are explainable (another known fire)
+- [ ] The orange outline in each panel matches the fire of the panel before
+- [ ] Every non-red fire is one you can name, or a plausible small fire
+- [ ] No other fire sits on a refinery, landfill or power plant
+
+### `visuals\<fire>_fires.png` -- every fire in the tile
+
+One map, every fire in its own colour with its name, dates and detection
+count; small fires are ringed so they can be found. Check the named fires
+against what you know burned, and look up any `Unmapped` fire that persists
+for several days at one spot: that is the signature of an industrial site.
 - [ ] Grey appears where you would expect missing observations, not randomly
 
 ### `qa_channels.png` -- all 18 channels on the peak day
@@ -226,6 +269,7 @@ or you in three months -- trust it:
 - `verification.json` -- every check result
 - `<fire>\qa\*.png` -- the visual record
 - `<fire>\perimeter.geojson` -- the reference the labels were checked against
+- `<fire>\fires.geojson` -- which fire every `fire_id` is
 - `<fire>\tables\*.csv` -- every detection with its keep/drop verdict
 
 When asking for help, send `build_report.txt`, not console output: the
@@ -245,6 +289,22 @@ report has credentials redacted, the console does not.
 | low perimeter coverage | days missing or filters too strict | check the stop-rule date and `--min-confidence` |
 | `no perimeter.geojson` | dataset built with an older version | rebuild |
 | `EARTH ENGINE UNAVAILABLE` | authentication or project | `earthengine authenticate`, then step 1 |
+| `footprint spillover at the coast` [warn] | a coastal fire; footprints reach past the shoreline | expected; see "Label size" below if it matters |
+| `labels registered to the features` [FAIL], `shifting land cover by` | labels offset from features | check tile origin and `fit_to_shape` |
+| known-event rain fails | rain over the fire, or (older builds) anywhere in the tile | the check now scores the fire's area; the note gives the wettest cell elsewhere |
+| `alarm date ... first seen ... labels start` | FRAP stores the UTC date; the fire started the previous evening, local time | expected; that night becomes the first sample |
+| fire labels on late days far from the fire, at low power | a refinery or flare that escaped the static filter | check `tables\*.csv` for the site; see the static-filter note in CHANGES |
+| cells ever burning many times the perimeter area | footprint rasterization (`all_touched`) | see "Label size" below |
+
+### Label size
+
+Labels are rasterized from detection footprints: every 1 km cell a footprint
+touches becomes fire. For Palisades this gives 276 km2 of cells ever burning
+against a 95 km2 perimeter. Part of that is unavoidable at 1 km; part is
+MODIS, whose footprints are several times larger than VIIRS. The
+`modis_only_fire_share` note in the verification shows how much of the label
+comes from MODIS alone. Whether to keep it, rasterize MODIS by centre only,
+or drop MODIS is a modelling decision -- record it with the dataset.
 
 ## Adding a new fire
 

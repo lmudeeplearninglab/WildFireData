@@ -22,8 +22,13 @@ LAYOUT
     /meta/step_hours     (N,)            int16
     /meta/tile           (N, 4)          float64   x0, y0, x1, y1 in the CRS
     /meta/detections     (N,)            int32
+    /fire_id             (N, 64, 64)     uint16    0 none, 1 the named fire, 2.. others
+    /meta/fire_names     (N,)            str       JSON {id: name} for that sample
     attrs                channels, crs, cell_m, tile_cells, label_classes,
                          source_dir, created, filter
+
+fire_id numbers are per build folder: fire 2 under palisades_2025 is not
+fire 2 under eaton_2025. /meta/fire_names says which fire each id is.
 
 Samples are ordered by fire, then date, so consecutive indices are
 consecutive days of the same fire.
@@ -107,6 +112,10 @@ def main() -> int:
         m_step = h5.create_dataset("meta/step_hours", shape=(n,), dtype="int16")
         m_tile = h5.create_dataset("meta/tile", shape=(n, 4), dtype="float64")
         m_det = h5.create_dataset("meta/detections", shape=(n,), dtype="int32")
+        fids = h5.create_dataset(
+            "fire_id", shape=(n, *first_l.shape), dtype="uint16",
+            chunks=(1, *first_l.shape), compression=comp)
+        m_names = h5.create_dataset("meta/fire_names", shape=(n,), dtype=str_t)
 
         crs_seen, filters_seen = set(), set()
         for i, path in enumerate(paths):
@@ -126,6 +135,11 @@ def main() -> int:
             m_step[i] = int(meta.get("step_hours", 24))
             m_tile[i] = meta.get("tile", [np.nan] * 4)
             m_det[i] = int(meta.get("detections", -1))
+            fid = F.load_fire_id(path)
+            if fid is not None:          # older samples: zeros, names "{}"
+                fids[i] = fid
+            m_names[i] = json.dumps({str(f["id"]): f["name"]
+                                     for f in meta.get("fires", [])})
             crs_seen.add(meta.get("crs"))
             filters_seen.add(meta.get("filter", "unrecorded"))
             if (i + 1) % 50 == 0 or i + 1 == n:

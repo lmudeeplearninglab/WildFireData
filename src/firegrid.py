@@ -70,7 +70,6 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -544,17 +543,26 @@ def ee_layer_on_grid(
     """
     # ee_project=None is fine: _init_earth_engine resolves it via
     # V.resolve_ee_project (--ee-project -> $EE_PROJECT -> DEFAULT_EE_PROJECT).
-    if not V.HAS_EARTH_ENGINE or not V._init_earth_engine(ee_project):
+    if not V.HAS_EARTH_ENGINE:
+        _warn_ee_once("earthengine-api is not installed "
+                      "(pip install earthengine-api)")
+        return None
+    if not V._init_earth_engine(ee_project):
+        _warn_ee_once("Earth Engine could not be initialized. Run "
+                      "'earthengine authenticate', then "
+                      "'python verify_ee_setup.py'")
         return None
 
     # Coarse-cadence products get a lookback window instead of a single day.
     lookback = LAYER_LOOKBACK_DAYS.get(layer_key)
     if lookback and time_mode == "daily" and date_str:
-        window_start = (datetime.strptime(date_str, "%Y-%m-%d")
-                        - timedelta(days=lookback)).strftime("%Y-%m-%d")
+        # Exactly `lookback` days ending before the label day (feature lag
+        # applied inside). Passing a start_date here instead stacked this
+        # lookback on top of the helper's own 30 days: 50 days for drought,
+        # 54 for vegetation, while the docs said 20 and 24.
         img = V._get_ee_image_for_layer(
-            layer_key, date_str=date_str, start_date=window_start,
-            end_date=date_str, time_mode="period",
+            layer_key, date_str=date_str, end_date=date_str,
+            time_mode="period", lookback_days=lookback,
         )
     else:
         img = V._get_ee_image_for_layer(
@@ -666,6 +674,20 @@ def _find_pixel_array(props: dict):
     return None
 
 
+_EE_WARNED: set[str] = set()
+
+
+def _warn_ee_once(message: str) -> None:
+    """Report an Earth Engine outage once, not once per layer per day.
+
+    Returning None silently was worse: a whole build finished in 20 seconds
+    with 1/18 channels and no indication why.
+    """
+    if message not in _EE_WARNED:
+        _EE_WARNED.add(message)
+        print(f"  EARTH ENGINE UNAVAILABLE: {message}")
+
+
 def fit_to_shape(arr: np.ndarray, spec: GridSpec = GRID_SPEC) -> np.ndarray:
     """Crop or pad to exactly the tile shape.
 
@@ -711,6 +733,7 @@ def save_sample(
     stack: np.ndarray,
     label: np.ndarray,
     meta: dict,
+    extras: dict | None = None,
 ) -> Path:
     """One compressed .npz per fire-day, with the spec embedded.
 
@@ -727,6 +750,7 @@ def save_sample(
         label=label,
         channels=np.array(CHANNELS),
         meta=np.array(json.dumps(meta)),
+        **(extras or {}),           # e.g. fire_id (fireattrib)
     )
     return path
 
@@ -769,6 +793,16 @@ def main() -> None:
     if args.out:
         pd.DataFrame([e.to_row() for e in events]).to_csv(args.out, index=False)
         print(f"\nSaved: {args.out}")
+
+
+def load_fire_id(path: Path) -> np.ndarray | None:
+    """The per-cell fire ID map saved beside the label, or None (older builds).
+
+    0 = no fire; 1 = the fire the build was asked for; 2.. = other fires,
+    named in fires.geojson in the same folder.
+    """
+    with np.load(path, allow_pickle=False) as z:
+        return z["fire_id"] if "fire_id" in z.files else None
 
 
 if __name__ == "__main__":

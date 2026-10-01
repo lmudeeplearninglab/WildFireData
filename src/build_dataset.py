@@ -46,6 +46,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import fireattrib as FA
 import firefilter as FF
 import firegrid as F
 import firelookup as L
@@ -199,9 +200,20 @@ def build_fire(record: L.FireRecord, args, map_key: str) -> dict:
     out_dir = Path(args.out) / _slug(record)
     _save_fire_record(out_dir, record, tile, envelope, start, end)
 
+    # --- which fire is each detection? (fireattrib) ----------------------
+    # The tile holds more than the named fire. Every kept detection gets a
+    # fire_id and a name: 1 = this fire, then other mapped fires, then
+    # unmapped clusters. Labels are unchanged; the IDs ride alongside.
+    df, fires = name_fires(df, record, envelope, start, end, args)
+    annotated = annotated.assign(fire_id=0, fire_name="")
+    annotated.loc[df.index, "fire_id"] = df["fire_id"]
+    annotated.loc[df.index, "fire_name"] = df["fire_name"]
+    FA.save_fires(out_dir, fires)
+
     # --- visuals, from the detections already fetched --------------------
     if args.visualize:
-        render_visuals(df, record, envelope, out_dir, args, annotated=annotated)
+        render_visuals(df, record, envelope, out_dir, args, annotated=annotated,
+                       fires=fires)
 
     # --- stage 3: static layers, once ------------------------------------
     print("  static layers...")
@@ -237,6 +249,17 @@ def build_fire(record: L.FireRecord, args, map_key: str) -> dict:
 
     lead_steps = args.lead_in_days * per_day
     label_keys = keys[lead_steps:]              # lead-in builds prev only
+    # FRAP alarm dates are UTC dates: an evening ignition in California is
+    # recorded as the next day (Eaton, 18:18 PST on 01-07 -> "2025-01-08").
+    # If the named fire was seen earlier in LOCAL time, labels start there,
+    # so its first night is a sample and not just lead-in.
+    seen = next((t.first_seen for t in fires if t.fire_id == 1), None)
+    if seen and record.alarm_date and seen < record.alarm_date:
+        early = [k for k in keys[1:lead_steps] if k[:10] >= seen]
+        if early:
+            label_keys = early + label_keys
+            print(f"  alarm date  CAL FIRE {record.alarm_date}, first seen {seen} "
+                  f"(local); labels start {early[0]}")
 
     # Stop once the fire has gone quiet. Meaningful only after static
     # removal: a refinery lights up every day, so without it a run of blank
@@ -252,17 +275,6 @@ def build_fire(record: L.FireRecord, args, map_key: str) -> dict:
               f"({blank_steps} steps) after {stop_after}; "
               f"{len(dropped)} later step(s) not written")
 
-    # Observation coverage at this step size, measured over the ACTIVE fire
-    # (after the stop rule) -- counting windows long after burnout would make
-    # every step size look worse than it is. With polar orbiters, finer steps
-    # leave most windows with no overpass; those can only be unobserved.
-    active = set(df["window"])
-    live = [k for k in label_keys if k >= min(active)] if active else []
-    observed = sum(1 for k in live if k in active)
-    if step < 24 and live:
-        print(f"  coverage    {observed}/{len(live)} {step}-hour windows observed "
-              f"while the fire was active ({observed / len(live) * 100:.0f}%)")
-
     # Which windows had a satellite overhead at all. FIRMS reports detections,
     # not overpasses, so this is inferred from ANY detection in the tile --
     # including the static sources excluded from the label, which light up on
@@ -272,6 +284,23 @@ def build_fire(record: L.FireRecord, args, map_key: str) -> dict:
     # pass that saw nothing at all is also marked unobserved -- which loses a
     # little data rather than inventing negatives.
     overpass_keys = set(annotated_windows.dropna())
+
+    # Coverage while the fire was active (from the first fire window on).
+    # Two different quantities, reported separately:
+    #   overpass       a satellite looked (any detection in the tile, including
+    #                  filtered static sources). Windows without one become
+    #                  unobserved across the whole tile.
+    #   fire detected  a satellite looked AND saw fire. The difference is
+    #                  passes where the fire was hidden by smoke or cloud, or
+    #                  had died down.
+    active = set(df["window"])
+    live = [k for k in label_keys if k >= min(active)] if active else []
+    if step < 24 and live:
+        n_pass = sum(1 for k in live if k in overpass_keys)
+        n_fire = sum(1 for k in live if k in active)
+        print(f"  coverage    {step}-hour windows while active: {len(live)}; "
+              f"with an overpass {n_pass} ({n_pass / len(live) * 100:.0f}%), "
+              f"with fire detected {n_fire} ({n_fire / len(live) * 100:.0f}%)")
 
     max_carry = to_steps(args.max_carry_days)
     label_set = set(label_keys)
@@ -285,6 +314,7 @@ def build_fire(record: L.FireRecord, args, map_key: str) -> dict:
         fire_mask = F.rasterize_fire_mask(step_df, tile, spec)
         label = F.mark_unobserved(fire_mask, prev_mask,
                                   day_had_detections=not step_df.empty, spec=spec)
+        fire_ids = FA.fire_id_map(step_df, tile, spec)
         observed = key in overpass_keys
         if not observed:
             label = np.full(spec.shape, F.LABEL_UNOBSERVED, dtype=np.uint8)
@@ -319,10 +349,13 @@ def build_fire(record: L.FireRecord, args, map_key: str) -> dict:
                 "source": record.source,
                 "exact_footprint": record.exact_footprint,
                 "filter": cfg.describe(),
+                "feature_lag_days": int(V._FEATURE_LAG_DAYS),
+                "fires": FA.cells_by_fire(fire_ids, fires),
                 "features_hold": "daily layers held (zero-order) across sub-daily steps"
                                  if step < 24 else "daily",
             }
-            path = F.save_sample(out_dir, f"{_slug(record)}_{key}", stack, lab, meta)
+            path = F.save_sample(out_dir, f"{_slug(record)}_{key}", stack, lab, meta,
+                                 extras={"fire_id": fire_ids})
             written += 1
             manifest.append({
                 "path": str(path.name), "window_start": key, "date": local_day,
@@ -332,6 +365,9 @@ def build_fire(record: L.FireRecord, args, map_key: str) -> dict:
                 "channels_present": len(present),
             })
             flag = "" if present else "   <-- NO FEATURES"
+            others = [f"{f['name']} {f['cells']}" for f in meta["fires"] if f["id"] != 1]
+            if others:
+                flag += "   other fires: " + ", ".join(others)
             if not observed:
                 flag += "   (no overpass: all unobserved)"
             print(f"    {key:<16} {len(step_df):>5,} det  "
@@ -393,7 +429,7 @@ def _save_fire_record(out_dir: Path, record, tile, envelope, start, end) -> None
 
 
 def render_visuals(df, record, envelope, out_dir: Path, args,
-                   annotated=None) -> None:
+                   annotated=None, fires=None) -> None:
     """Produce the visualize_firms_dataset_v3 outputs for this fire.
 
     Reuses the DataFrame build_fire already fetched rather than re-querying
@@ -435,6 +471,10 @@ def render_visuals(df, record, envelope, out_dir: Path, args,
         ("time", lambda: V.plot_fire_map_time_based(
             df, f"{label} -- detections over time", envelope,
             vis_dir / f"{base}_time.png")),
+        ("fires", lambda: FA.plot_fires(
+            df, fires or [], envelope, vis_dir / f"{base}_fires.png",
+            f"{label} -- every fire in the tile ({len(fires or [])})",
+            basemap=args.basemap)),
     ]
     for name, job in jobs:
         try:
@@ -551,8 +591,9 @@ def run_interactive() -> argparse.Namespace:
         "Blank days that keep the previous fire mask alive", "2") or 2)
     print("   Prediction time step. Finer is faster to act on, but polar")
     print("   orbiters pass in clusters with gaps up to ~12 h:")
-    print("   (share of windows observed while Eaton was burning)")
-    print("   24 = daily (all)   12 = ~65%   6 = ~45%   1 = ~14% (needs GOES)")
+    print("   Windows with a satellite overhead while Eaton burned:")
+    print("   24 = daily (all)   12 = 94%   6 = 61%   3 = 31%   1 = 20% (needs GOES)")
+    print("   Windows with no overpass are labelled unobserved.")
     step_raw = _prompt("Step in hours (24, 12, 6, 3, 1)", "24").strip()
     args.step_hours = int(step_raw) if step_raw in {"1", "2", "3", "4", "6", "8", "12", "24"} else 24
 
@@ -597,6 +638,7 @@ def run_interactive() -> argparse.Namespace:
     print("   Refineries, gas flares and power plants show up as heat every day.")
     args.keep_static = not _prompt(
         "Remove static heat sources? (y/n)", "y").lower().startswith("y")
+    args.no_fire_names = False
     args.target_only = _prompt(
         "Label only the named fire, dropping other fires in the tile? (y/n)",
         "n").lower().startswith("y")
@@ -668,10 +710,11 @@ def main() -> int:
                          "Not written as samples (default 2)")
     ap.add_argument("--tail-days", type=int, default=3)
     ap.add_argument("--step-hours", type=int, default=24, choices=[1, 2, 3, 4, 6, 8, 12, 24],
-                    help="Prediction time step. 24 = daily (default). With polar-orbiter "
-                         "labels, the Eaton fire was observed in ~65%% of 12-hour "
-                         "windows, ~45%% of 6-hour and ~14%% of 1-hour windows; the "
-                         "rest are labelled unobserved. See the coverage line per fire.")
+                    help="Prediction time step. 24 = daily (default). While Eaton "
+                         "burned, a satellite was overhead in 94%% of 12-hour windows, "
+                         "61%% of 6-hour and 20%% of 1-hour windows; windows with no "
+                         "overpass are labelled unobserved. Each build prints this "
+                         "for its own fire on the coverage line.")
     ap.add_argument("--max-carry-days", type=int, default=2,
                     help="How many consecutive blank days keep the previous "
                          "fire mask alive before it is treated as burnt out "
@@ -685,6 +728,10 @@ def main() -> int:
                          "sources in the label. Off by default.")
     ap.add_argument("--target-only", action="store_true",
                     help="Label only the named fire; drop other fires in the tile")
+    ap.add_argument("--no-fire-names", action="store_true",
+                    help="Skip the agency-perimeter lookup that names other fires "
+                         "in the tile. They are still separated and numbered "
+                         "(Unmapped #1, #2, ...).")
     ap.add_argument("--stop-after-blank-days", type=int, default=3,
                     help="Stop writing samples after this many consecutive days "
                          "with no surviving detections (0 = never). Default 3.")
@@ -835,6 +882,26 @@ def _place_report(staging: Path, out_dir: Path) -> Path | None:
     except OSError as err:
         print(f"  could not move the transcript ({err}); it is at {staging}")
         return staging
+
+
+def name_fires(df, record, envelope, start, end, args):
+    """Attribute every kept detection to a fire and print the roll call.
+
+    One extra request: every mapped perimeter intersecting the tile during
+    the fetch window. If it fails, other fires are still separated, just not
+    named.
+    """
+    neighbours = []
+    if not getattr(args, "no_fire_names", False):
+        try:
+            neighbours = L.perimeters_in_area(envelope, record.year, start, end)
+        except Exception as err:
+            print(f"  fires       perimeter lookup failed "
+                  f"({str(err).splitlines()[0][:100]}); other fires stay unnamed")
+    df, fires = FA.attribute(df, record, neighbours, crs=F.GRID_SPEC.crs,
+                             tail_days=args.tail_days)
+    print(FA.summarize(fires))
+    return df, fires
 
 
 if __name__ == "__main__":
